@@ -1,0 +1,40 @@
+{
+  "name": "notisky",
+  "description": "A Web Extension that enhances Bluesky with notification features",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wxt",
+    "dev:firefox": "wxt -b firefox",
+    "dev:safari": "wxt -b safari",
+    "build": "wxt build",
+    "build:firefox": "wxt build -b firefox",
+    "build:safari": "wxt build -b safari",
+    "zip": "wxt zip",
+    "zip:firefox": "wxt zip -b firefox",
+    "zip:safari": "wxt zip -b safari",
+    "compile": "tsc --noEmit",
+    "postinstall": "wxt prepare"
+  },
+  "keywords": [
+    "browser-extension",
+    "bluesky",
+    "notifications",
+    "wxt"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@atproto/api": "^0.11.2",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.1",
+    "@types/react-dom": "^19.0.2",
+    "@wxt-dev/module-react": "^1.1.2",
+    "typescript": "^5.6.3",
+    "wxt": "^0.20.0"
+  }
+}
