@@ -1,377 +1,285 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
+import { browser } from 'wxt/browser';
+import type { AccountSession } from '../../utils/storage'; // Correct path
+import type { UserPreferences } from '../../utils/preferences'; // Correct path
+import { defaultPreferences } from '../../utils/preferences'; // Correct path
+// Assuming shared styles with popup or dedicated options styles
+// import './App.css'; 
+import './style.css'; // Use existing style for now
 
+// TODO: Define preference interface and storage logic
 interface UserPreferences {
-  updateSiteIcon: boolean;
-  updateExtensionIcon: boolean;
-  enableNotifications: boolean;
-  keepPageAlive: boolean;
-  refreshInterval: number;
-  notificationServerUrl: string;
-  notificationServerUserId: string;
+  // Define preference fields here
+  pollingIntervalMinutes: number;
+  showDesktopNotifications: boolean;
+  showDetailedNotifications: boolean;
 }
 
-const defaultPreferences: UserPreferences = {
-  updateSiteIcon: true,
-  updateExtensionIcon: true,
-  enableNotifications: true,
-  keepPageAlive: true,
-  refreshInterval: 1,
-  notificationServerUrl: 'https://notisky.symm.app',
-  notificationServerUserId: ''
-};
-
 const App: React.FC = () => {
+  const [activeTab, setActiveTab] = useState<'accounts' | 'preferences' | 'about'>('accounts');
+  const [accounts, setAccounts] = useState<Record<string, AccountSession>>({});
+  const [loadingAccounts, setLoadingAccounts] = useState(true);
   const [preferences, setPreferences] = useState<UserPreferences>(defaultPreferences);
-  const [activeTab, setActiveTab] = useState<string>('preferences');
-  const [statusMessage, setStatusMessage] = useState<{ text: string, type: string } | null>(null);
-  const [serverStatus, setServerStatus] = useState<'checking' | 'connected' | 'error'>('checking');
-  const [accountsInfo, setAccountsInfo] = useState<any[]>([]);
+  const [loadingPreferences, setLoadingPreferences] = useState(true);
+  const [savingPreferences, setSavingPreferences] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
 
-  // Load preferences when component mounts
-  useEffect(() => {
-    loadPreferences();
-    fetchLinkedAccounts();
-  }, []);
-
-  // Check server connection when component mounts
-  useEffect(() => {
-    checkServerConnection();
-  }, []);
-
-  // Function to load user preferences
-  const loadPreferences = async () => {
+  // Fetch accounts from background script
+  const fetchAccounts = useCallback(async () => {
+    setLoadingAccounts(true);
+    setError(null);
     try {
-      const result = await browser.storage.sync.get(defaultPreferences);
-      setPreferences(result as UserPreferences);
-      console.log('Preferences loaded:', result);
-    } catch (error) {
-      console.error('Error loading preferences:', error);
-      showStatusMessage('Error loading preferences', 'error');
-    }
-  };
-
-  // Function to save user preferences
-  const savePreferences = async () => {
-    try {
-      await browser.storage.sync.set(preferences);
-      console.log('Preferences saved:', preferences);
-      showStatusMessage('Preferences saved!', 'success');
-      
-      // Notify background script of changes
-      await browser.runtime.sendMessage({
-        action: 'preferencesUpdated',
-        preferences
-      });
-    } catch (error) {
-      console.error('Error saving preferences:', error);
-      showStatusMessage('Error saving preferences', 'error');
-    }
-  };
-
-  // Fetch accounts linked to this extension
-  const fetchLinkedAccounts = async () => {
-    try {
-      const { accounts = [] } = await browser.storage.local.get('accounts');
-      setAccountsInfo(accounts);
-    } catch (error) {
-      console.error('Error fetching linked accounts:', error);
-    }
-  };
-
-  // Check connection to notification server
-  const checkServerConnection = async () => {
-    setServerStatus('checking');
-
-    try {
-      // Use the fixed Vercel deployment URL
-      const url = 'https://notisky.symm.app';
-      
-      // First try the status.json file which is more reliable
-      try {
-        const jsonResponse = await fetch(`${url}/api/status.json`, {
-          method: 'GET',
-          headers: {
-            'Accept': 'application/json'
-          },
-          mode: 'cors'
-        });
-        
-        if (jsonResponse.ok) {
-          const contentType = jsonResponse.headers.get('content-type');
-          if (contentType && contentType.includes('application/json')) {
-            const data = await jsonResponse.json();
-            if (data.success) {
-              setServerStatus('connected');
-              setPreferences(prev => ({ ...prev, notificationServerUrl: url }));
-              return;
-            }
-          }
-        }
-      } catch (jsonError) {
-        console.warn('Could not fetch from status.json, trying API endpoint:', jsonError);
-      }
-
-      // Fallback to the API endpoint
-      const response = await fetch(`${url}/api/status`, {
-        method: 'GET',
-        headers: {
-          'Accept': 'application/json'
-        },
-        mode: 'cors'
-      }).catch(error => {
-        console.error('Fetch error:', error);
-        throw error;
-      });
-      
-      if (response.ok) {
-        // Verify content type is JSON before trying to parse
-        const contentType = response.headers.get('content-type');
-        if (contentType && contentType.includes('application/json')) {
-          const data = await response.json();
-          if (data.success) {
-            setServerStatus('connected');
-            setPreferences(prev => ({ ...prev, notificationServerUrl: url }));
-            return;
-          } else {
-            console.error('Server returned non-success status:', data);
-            setServerStatus('error');
-          }
-        } else {
-          console.error('Server returned non-JSON content type:', contentType);
-          setServerStatus('error');
-        }
+      const response = await browser.runtime.sendMessage({ action: 'getAccounts' });
+      if (response.success) {
+        setAccounts(response.accounts || {});
       } else {
-        console.error('Server returned error status:', response.status);
-        setServerStatus('error');
+        console.error('Failed to fetch accounts:', response.error);
+        setError('Failed to load account data.');
+        setAccounts({});
       }
-    } catch (error) {
-      console.error('Error connecting to notification server:', error);
-      setServerStatus('error');
+    } catch (err: any) {
+      console.error('Error messaging background script:', err);
+      setError('Could not connect to extension background. Try reloading the extension.');
+      setAccounts({});
+    } finally {
+      setLoadingAccounts(false);
+    }
+  }, []);
+
+  const fetchPreferences = useCallback(async () => {
+    setLoadingPreferences(true);
+    setError(null);
+    try {
+      const response = await browser.runtime.sendMessage({ action: 'getPreferences' });
+      if (response.success) {
+        setPreferences(response.preferences || defaultPreferences);
+      } else {
+        setError('Failed to load preferences: ' + response.error);
+        setPreferences(defaultPreferences);
+      }
+    } catch (err: any) {
+      setError('Could not connect to extension background for preferences.');
+      setPreferences(defaultPreferences);
+    } finally {
+      setLoadingPreferences(false);
+    }
+  }, []);
+
+  // Initial load and listener setup
+  useEffect(() => {
+    fetchAccounts();
+    fetchPreferences();
+
+    // Listener for updates from background script
+    const messageListener = (message: any) => {
+      if (message.action === 'authStateChanged') {
+        console.log('Options received authStateChanged:', message.accounts);
+        setAccounts(message.accounts || {});
+        setError(null); // Clear error on update
+      } else if (message.action === 'preferencesChanged') {
+        console.log('Options received preferencesChanged:', message.preferences);
+        setPreferences(message.preferences || defaultPreferences);
+        setError(null);
+      }
+    };
+
+    browser.runtime.onMessage.addListener(messageListener);
+
+    // Cleanup listener on component unmount
+    return () => {
+      browser.runtime.onMessage.removeListener(messageListener);
+    };
+  }, [fetchAccounts, fetchPreferences]);
+
+  // Start Authentication Flow (same as popup)
+  const handleLogin = async () => {
+    setError(null);
+    try {
+      const response = await browser.runtime.sendMessage({ action: 'authenticate' });
+      if (!response.success) {
+        setError(response.error || 'Failed to start login.');
+      }
+      // Background script handles the rest
+    } catch (err: any) {
+      setError('Failed to communicate with extension for login.');
     }
   };
 
-  // Function to show status message
-  const showStatusMessage = (text: string, type: string) => {
-    setStatusMessage({ text, type });
-    setTimeout(() => {
-      setStatusMessage(null);
-    }, 3000);
+  // Remove an Account (same as popup)
+  const handleRemoveAccount = async (did: string) => {
+    setError(null);
+    try {
+      const response = await browser.runtime.sendMessage({ action: 'removeAccount', did: did });
+      if (!response.success) {
+        setError(response.error || 'Failed to remove account.');
+      }
+      // UI update via authStateChanged listener
+    } catch (err: any) {
+      setError('Failed to communicate with extension to remove account.');
+    }
+  };
+  
+  const handlePreferenceChange = (key: keyof UserPreferences, value: any) => {
+    // Basic type coercion for form elements
+    let processedValue = value;
+    if (typeof defaultPreferences[key] === 'number') {
+      processedValue = parseInt(value, 10) || 0; 
+    } else if (typeof defaultPreferences[key] === 'boolean') {
+      processedValue = !!value; // Ensure boolean
+    }
+    setPreferences(prev => ({ ...prev, [key]: processedValue }));
+    setStatusMessage(null); // Clear status on change
   };
 
-  // Handle preference change
-  const handlePreferenceChange = (key: keyof UserPreferences, value: boolean | number | string) => {
-    setPreferences({
-      ...preferences,
-      [key]: value
-    });
+  const handleSavePreferences = async () => {
+    setSavingPreferences(true);
+    setError(null);
+    setStatusMessage(null);
+    try {
+      const response = await browser.runtime.sendMessage({
+        action: 'savePreferences',
+        preferences: preferences
+      });
+      if (response.success) {
+        setStatusMessage('Preferences saved successfully!');
+      } else {
+        setError('Failed to save preferences: ' + response.error);
+      }
+    } catch (err: any) {
+      setError('Error communicating with extension to save preferences.');
+    } finally {
+      setSavingPreferences(false);
+    }
   };
 
-  // Open auth portal in new tab
-  const openAuthPortal = () => {
-    browser.tabs.create({ url: 'https://notisky.symm.app' });
-  };
+  const accountList = Object.values(accounts);
 
   return (
-    <div className="container">
+    <div className="container options-container"> {/* Add specific options class? */} 
       <header className="app-header">
-        <img src="../assets/icons/icon48.png" alt="Notisky Logo" className="logo" />
-        <h1>Notisky Notifications</h1>
+        {/* Use relative path for assets in options page */} 
+        <img src="../icon/48.png" alt="Notisky Logo" className="logo" /> 
+        <h1>Notisky Settings</h1>
       </header>
 
       <div className="tab-navigation">
-        <div 
-          className={`tab ${activeTab === 'preferences' ? 'active' : ''}`}
-          onClick={() => setActiveTab('preferences')}
-        >
-          Preferences
-        </div>
-        <div 
+        <button 
           className={`tab ${activeTab === 'accounts' ? 'active' : ''}`}
           onClick={() => setActiveTab('accounts')}
         >
           Accounts
-        </div>
-        <div 
+        </button>
+        <button 
+          className={`tab ${activeTab === 'preferences' ? 'active' : ''}`}
+          onClick={() => setActiveTab('preferences')}
+        >
+          Preferences
+        </button>
+        <button 
           className={`tab ${activeTab === 'about' ? 'active' : ''}`}
           onClick={() => setActiveTab('about')}
         >
           About
-        </div>
+        </button>
       </div>
 
+      {error && <div className="error-message">Error: {error}</div>}
+      {statusMessage && <div className="status-message success-message">{statusMessage}</div>}
+
+      {/* Accounts Tab */} 
+      <div className={`tab-content ${activeTab === 'accounts' ? 'active' : ''}`} id="accounts-tab">
+        <h2>Accounts</h2>
+        {loadingAccounts ? (
+          <p>Loading accounts...</p>
+        ) : accountList.length > 0 ? (
+          <ul className="accounts-list options-accounts-list">
+            {accountList.map((account) => (
+              <li key={account.did} className="account-item">
+                <span>@{account.handle}</span>
+                <button 
+                  onClick={() => handleRemoveAccount(account.did)} 
+                  className="remove-button"
+                  title={`Log out ${account.handle}`}
+                >
+                  Logout
+                </button>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p>No accounts logged in.</p>
+        )}
+        <button onClick={handleLogin} className="login-button add-account-button">
+          {accountList.length > 0 ? 'Add Another Account' : 'Login with Bluesky'}
+        </button>
+      </div>
+
+      {/* Preferences Tab */} 
       <div className={`tab-content ${activeTab === 'preferences' ? 'active' : ''}`} id="preferences-tab">
-        <h2>Notification Settings</h2>
-        <div className="toggle-container">
-          <div className="toggle-option">
-            <div>
-              <div className="option-label">Update Website Icon</div>
-              <div className="option-description">Show notification count on the Bluesky website favicon</div>
+        <h2>Preferences</h2>
+        {loadingPreferences ? <p>Loading preferences...</p> : (
+          <div className="preferences-form">
+            <div className="form-group">
+              <label htmlFor="pollingInterval">Check for Notifications Every:</label>
+              <div className="input-with-unit">
+                <input
+                  type="number"
+                  id="pollingInterval"
+                  min="1"
+                  value={preferences.pollingIntervalMinutes}
+                  onChange={(e) => handlePreferenceChange('pollingIntervalMinutes', e.target.value)}
+                  disabled={savingPreferences}
+                />
+                <span>minutes</span>
+              </div>
+              <small>Minimum 1 minute. More frequent checks use more resources.</small>
             </div>
-            <label className="toggle-switch">
-              <input
-                type="checkbox"
-                checked={preferences.updateSiteIcon}
-                onChange={(e) => handlePreferenceChange('updateSiteIcon', e.target.checked)}
-              />
-              <span className="slider"></span>
-            </label>
-          </div>
 
-          <div className="toggle-option">
-            <div>
-              <div className="option-label">Update Extension Icon</div>
-              <div className="option-description">Show notification count on the extension icon</div>
+            <div className="form-group">
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={preferences.showDesktopNotifications}
+                  onChange={(e) => handlePreferenceChange('showDesktopNotifications', e.target.checked)}
+                  disabled={savingPreferences}
+                />
+                Show Desktop Notifications
+              </label>
+              <small>Display a system notification when new activity is found.</small>
             </div>
-            <label className="toggle-switch">
-              <input
-                type="checkbox"
-                checked={preferences.updateExtensionIcon}
-                onChange={(e) => handlePreferenceChange('updateExtensionIcon', e.target.checked)}
-              />
-              <span className="slider"></span>
-            </label>
-          </div>
 
-          <div className="toggle-option">
-            <div>
-              <div className="option-label">Enable Desktop Notifications</div>
-              <div className="option-description">Show desktop notifications for new activity</div>
+            {/* New Preference Toggle */}
+            <div className="form-group">
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={preferences.showDetailedNotifications}
+                  onChange={(e) => handlePreferenceChange('showDetailedNotifications', e.target.checked)}
+                  disabled={savingPreferences || !preferences.showDesktopNotifications} // Disable if desktop notifications are off
+                />
+                Show Notification Details
+              </label>
+              <small>Include details like username and post content in desktop notifications. Disable for more privacy.</small>
             </div>
-            <label className="toggle-switch">
-              <input
-                type="checkbox"
-                checked={preferences.enableNotifications}
-                onChange={(e) => handlePreferenceChange('enableNotifications', e.target.checked)}
-              />
-              <span className="slider"></span>
-            </label>
-          </div>
+            
+            {/* Add more preference controls here */} 
 
-          <div className="toggle-option">
-            <div>
-              <div className="option-label">Background Checking</div>
-              <div className="option-description">Check for notifications in the background</div>
-            </div>
-            <label className="toggle-switch">
-              <input
-                type="checkbox"
-                checked={preferences.keepPageAlive}
-                onChange={(e) => handlePreferenceChange('keepPageAlive', e.target.checked)}
-              />
-              <span className="slider"></span>
-            </label>
-          </div>
-        </div>
-
-        <div className="input-group visible">
-          <label htmlFor="refresh-interval">Check Interval (minutes)</label>
-          <input
-            type="number"
-            id="refresh-interval"
-            min="1"
-            max="60"
-            value={preferences.refreshInterval}
-            onChange={(e) => handlePreferenceChange('refreshInterval', parseInt(e.target.value) || 1)}
-          />
-        </div>
-
-        <div className="action-buttons">
-          <button onClick={savePreferences} className="primary-button">Save Preferences</button>
-        </div>
-
-        {statusMessage && (
-          <div className={`message ${statusMessage.type}`}>
-            {statusMessage.text}
+            <button onClick={handleSavePreferences} disabled={savingPreferences} className="save-button">
+              {savingPreferences ? 'Saving...' : 'Save Preferences'}
+            </button>
           </div>
         )}
       </div>
-      
-      <div className={`tab-content ${activeTab === 'accounts' ? 'active' : ''}`} id="accounts-tab">
-        <h2>Bluesky Accounts</h2>
-        
-        <div className="accounts-section">
-          <div className="server-status-banner">
-            <div className={`status-indicator ${serverStatus}`}>
-              {serverStatus === 'checking' && 'Checking connection to Notisky server...'}
-              {serverStatus === 'connected' && 'Connected to Notisky authentication server'}
-              {serverStatus === 'error' && 'Error connecting to Notisky server'}
-            </div>
-          </div>
-          
-          {accountsInfo.length > 0 ? (
-            <div className="accounts-list">
-              <h3>Connected Accounts</h3>
-              {accountsInfo.map((account, index) => (
-                <div key={index} className="account-card">
-                  <div className="account-info">
-                    <div className="account-handle">@{account.handle}</div>
-                    <div className="account-did">{account.did}</div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <div className="no-accounts">
-              <p>No accounts connected yet.</p>
-            </div>
-          )}
-          
-          <div className="auth-actions">
-            <button onClick={openAuthPortal} className="primary-button">
-              Manage Accounts in Auth Portal
-            </button>
-          </div>
-          
-          <div className="accounts-help">
-            <p>
-              Notisky uses the Authentication Portal to securely manage your Bluesky accounts.
-              You can connect multiple accounts to receive real-time notifications from all of them.
-            </p>
-          </div>
-        </div>
+
+      {/* About Tab */} 
+      <div className={`tab-content ${activeTab === 'about' ? 'active' : ''}`} id="about-tab">
+        <h2>About Notisky</h2>
+        <p>Version: {browser.runtime.getManifest().version}</p>
+        <p>Enhances Bluesky with multi-account notifications.</p>
+        {/* TODO: Add links to GitHub, privacy policy etc. */} 
       </div>
 
-      <div className={`tab-content ${activeTab === 'about' ? 'active' : ''}`} id="about-tab">
-        <h2>About Notisky Notifications</h2>
-        <p>
-          Notisky is a browser extension that enhances Bluesky with notification features.
-          It helps you stay updated with your Bluesky notifications without having to keep checking the site.
-        </p>
-        <p>
-          <strong>Version:</strong> 1.0.0
-        </p>
-        <p>
-          <strong>Supported Browsers:</strong> Chrome, Firefox, Safari
-        </p>
-        <p>
-          <strong>Features:</strong>
-        </p>
-        <ul>
-          <li>Display notification count on the extension icon</li>
-          <li>Display notification count on the Bluesky tab favicon</li>
-          <li>Background notification checking</li>
-          <li>Desktop notifications</li>
-          <li>Real-time multi-account notifications via Notisky server</li>
-        </ul>
-        
-        <div className="auth-actions">
-          <a href="https://notisky.symm.app" target="_blank" rel="noopener noreferrer" className="secondary-button">
-            Visit Auth Portal
-          </a>
-          <a href="https://github.com/symmetricalboy/notisky" target="_blank" rel="noopener noreferrer" className="secondary-button">
-            GitHub Repository
-          </a>
-        </div>
-      </div>
-      
-      <footer className="app-footer">
-        <p className="footer-slogan">Free & open source, for all, forever.</p>
-        <p className="footer-contact">
-          Feedback, suggestions, assistance, & updates:
-          <a href="https://bsky.app/profile/symm.app" target="_blank" rel="noopener noreferrer">@symm.app</a>
-        </p>
-        <p className="footer-copyright">Copyright (c) 2025 Dylan Gregori Singer (symmetricalboy)</p>
-      </footer>
     </div>
   );
 };

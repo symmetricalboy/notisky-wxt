@@ -1,289 +1,368 @@
-/**
- * Authentication utility for Notisky using a direct OAuth flow
- * Implementation inspired by atcute's OAuth approach
- */
+import { browser } from 'wxt/browser';
 
-// Auth configuration
-const AUTH_CONFIG = {
-  // Use Bluesky's intent/oauth endpoint directly
-  authUrl: 'https://bsky.app/intent/oauth',
-  // Base URL for the auth server
-  serverBaseUrl: 'https://notisky.symm.app',
-  // The redirect URL that will receive the authorization code
-  redirectUrl: 'https://notisky.symm.app/auth/callback',
-  // Client ID for the application
-  clientId: 'notisky-extension',
-  // Well-known client metadata URL (required for Bluesky OAuth)
-  clientMetadataUrl: 'https://notisky.symm.app/.well-known/oauth-client-metadata.json'
-};
+// Placeholder for Bluesky OAuth configuration - replace with actual values
+const BLUESKY_CLIENT_ID = 'https://notisky.symm.app/client-metadata.json'; // Use the URL of the hosted metadata file
+const BLUESKY_AUTHORIZATION_ENDPOINT = 'https://bsky.app/oauth/authorize'; // TODO: Verify endpoint
+const BLUESKY_TOKEN_ENDPOINT = 'https://api.bsky.app/oauth/token'; // TODO: Verify endpoint
+const DPOP_KEY_STORAGE_KEY = 'notisky_dpop_keypair';
+const TOKEN_ENDPOINT_NONCE_KEY = 'notisky_token_endpoint_nonce';
 
-/**
- * Interface for authentication responses
- */
-export interface AuthResponse {
-  success: boolean;
-  token?: string;
-  error?: string;
-}
-
-/**
- * Initiates the authorization flow using a direct tab-based approach
- * This avoids using browser.identity which can be problematic in extensions
- */
-export async function authenticateUser(): Promise<AuthResponse> {
-  try {
-    console.log('Starting direct authentication flow');
-    
-    // Generate state and PKCE values
-    const state = generateRandomString(16);
-    const codeVerifier = generateRandomString(64);
-    const codeChallenge = await generateCodeChallenge(codeVerifier);
-    
-    // Store auth state data
-    await storeAuthState(state, codeVerifier);
-    
-    // Set up the message listener before opening the tab
-    const authPromise = setupAuthListener(state);
-    
-    // Build the authorization URL with PKCE challenge
-    const authUrl = buildAuthUrl(state, codeChallenge);
-    
-    // Open the auth URL in a new tab
-    await browser.tabs.create({ url: authUrl });
-    
-    // Wait for the auth result from the listener
-    return await authPromise;
-  } catch (error: any) {
-    console.error('Authentication flow error:', error);
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : 'Unknown authentication error'
-    };
-  }
-}
-
-/**
- * Set up a message listener for the authentication callback
- */
-function setupAuthListener(expectedState: string): Promise<AuthResponse> {
-  return new Promise((resolve) => {
-    // Set up storage listener to handle auth completion
-    const storageListener = async (changes: any) => {
-      if (changes.auth_code && changes.auth_state) {
-        const code = changes.auth_code.newValue;
-        const state = changes.auth_state.newValue;
-        
-        // Verify state matches
-        if (state !== expectedState) {
-          console.error('State mismatch in auth flow');
-          resolve({
-            success: false,
-            error: 'Security verification failed (state mismatch)'
-          });
-          return;
-        }
-        
-        try {
-          // Get stored code verifier
-          const { auth_code_verifier } = await browser.storage.local.get('auth_code_verifier');
-          
-          // Exchange code for token
-          const tokenResponse = await exchangeCodeForToken(code, auth_code_verifier);
-          
-          // Clean up storage
-          await browser.storage.local.remove(['auth_code', 'auth_state', 'auth_code_verifier']);
-          
-          // Resolve with success
-          resolve({
-            success: true,
-            token: tokenResponse.access_token
-          });
-        } catch (error: any) {
-          console.error('Error exchanging code for token:', error);
-          resolve({
-            success: false,
-            error: error instanceof Error ? error.message : 'Token exchange failed'
-          });
-        }
-      }
-    };
-    
-    // Also listen for direct messages from content script
-    const messageListener = async (message: any, sender: any) => {
-      if (message.action === 'authSuccess' && message.code && message.state) {
-        console.log('Received auth success message from content script');
-        
-        // Verify state matches
-        if (message.state !== expectedState) {
-          console.error('State mismatch in auth flow (message)');
-          // Don't resolve here as storage listener will handle it
-          return;
-        }
-        
-        try {
-          // Get stored code verifier
-          const { auth_code_verifier } = await browser.storage.local.get('auth_code_verifier');
-          
-          // Exchange code for token
-          const tokenResponse = await exchangeCodeForToken(message.code, auth_code_verifier);
-          
-          // Clean up storage
-          await browser.storage.local.remove(['auth_code', 'auth_state', 'auth_code_verifier']);
-          
-          // Resolve with success
-          resolve({
-            success: true,
-            token: tokenResponse.access_token
-          });
-          
-          // Clean up listeners
-          browser.storage.onChanged.removeListener(storageListener);
-          browser.runtime.onMessage.removeListener(messageListener);
-          
-          return true;
-        } catch (error: any) {
-          console.error('Error exchanging code for token (message):', error);
-          // Don't resolve here as storage listener will handle it
-          return;
-        }
-      }
-    };
-    
-    // Listen for storage changes
-    browser.storage.onChanged.addListener(storageListener);
-    
-    // Listen for messages
-    browser.runtime.onMessage.addListener(messageListener);
-    
-    // Set a timeout to clean up and reject after 5 minutes
-    setTimeout(() => {
-      browser.storage.onChanged.removeListener(storageListener);
-      browser.runtime.onMessage.removeListener(messageListener);
-      resolve({
-        success: false,
-        error: 'Authentication timed out. Please try again.'
-      });
-    }, 300000); // 5 minute timeout
-  });
-}
-
-/**
- * Build the authorization URL for Bluesky OAuth
- */
-function buildAuthUrl(state: string, codeChallenge: string): string {
-  const url = new URL(AUTH_CONFIG.authUrl);
-  
-  // Add required OAuth 2.0 parameters for Bluesky
-  url.searchParams.append('client_id', AUTH_CONFIG.clientMetadataUrl);
-  url.searchParams.append('redirect_uri', AUTH_CONFIG.redirectUrl);
-  url.searchParams.append('response_type', 'code');
-  url.searchParams.append('state', state);
-  url.searchParams.append('code_challenge', codeChallenge);
-  url.searchParams.append('code_challenge_method', 'S256');
-  
-  // Add Bluesky-specific scopes
-  url.searchParams.append('scope', 'com.atproto.feed:read com.atproto.feed:write com.atproto.notification:read');
-  
-  // Log the full URL for debugging
-  console.log('Built auth URL:', url.toString());
-  return url.toString();
-}
-
-/**
- * Generate a cryptographically secure random string
- */
+// Generate a random string for state and code_verifier
 function generateRandomString(length: number): string {
-  const array = new Uint8Array(length);
-  crypto.getRandomValues(array);
-  return Array.from(array, byte => byte.toString(16).padStart(2, '0')).join('');
+  const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
+  let result = '';
+  const charactersLength = characters.length;
+  for (let i = 0; i < length; i++) {
+    result += characters.charAt(Math.floor(Math.random() * charactersLength));
+  }
+  return result;
 }
 
-/**
- * Generate PKCE code challenge from verifier
- */
+// Generate code_challenge from code_verifier using SHA-256
 async function generateCodeChallenge(verifier: string): Promise<string> {
-  // Convert verifier to Uint8Array
   const encoder = new TextEncoder();
   const data = encoder.encode(verifier);
-  
-  // Hash with SHA-256
-  const hash = await crypto.subtle.digest('SHA-256', data);
-  
-  // Convert to base64url
-  return btoa(String.fromCharCode(...new Uint8Array(hash)))
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  // Base64 URL encode the digest
+  return btoa(String.fromCharCode(...new Uint8Array(digest)))
     .replace(/\+/g, '-')
     .replace(/\//g, '_')
-    .replace(/=+$/, '');
+    .replace(/=/g, '');
 }
 
-/**
- * Store authentication state in local storage
- */
-async function storeAuthState(state: string, codeVerifier: string): Promise<void> {
-  await browser.storage.local.set({
-    auth_state_expected: state,
-    auth_code_verifier: codeVerifier,
-    auth_flow_started: Date.now()
-  });
+// Base64 URL encoding/decoding helpers
+function base64UrlEncode(buffer: ArrayBuffer): string {
+  return btoa(String.fromCharCode(...new Uint8Array(buffer)))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=/g, '');
 }
 
-/**
- * Exchange the authorization code for an access token
- */
-async function exchangeCodeForToken(code: string, codeVerifier: string): Promise<any> {
-  const response = await fetch(`${AUTH_CONFIG.serverBaseUrl}/api/token`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      code,
-      code_verifier: codeVerifier,
-      redirect_uri: AUTH_CONFIG.redirectUrl,
-      client_id: AUTH_CONFIG.clientId,
-      grant_type: 'authorization_code'
-    })
-  });
-
-  if (!response.ok) {
-    const errorData = await response.json();
-    throw new Error(errorData.error || 'Failed to exchange code for token');
+function base64UrlDecode(value: string): ArrayBuffer {
+  value = value.replace(/-/g, '+').replace(/_/g, '/');
+  while (value.length % 4) {
+    value += '=';
   }
-
-  return response.json();
+  const base64 = atob(value);
+  const buffer = new Uint8Array(base64.length);
+  for (let i = 0; i < base64.length; i++) {
+    buffer[i] = base64.charCodeAt(i);
+  }
+  return buffer.buffer;
 }
 
+// --- DPoP Functions --- 
+
 /**
- * Check if the user is currently authenticated
+ * Generates or loads the persistent DPoP signing key pair for the extension instance.
+ * Stores the key pair in local storage.
  */
-export async function isAuthenticated(): Promise<boolean> {
+async function getDPoPKeyPair(): Promise<DPoPKeyPair | null> {
   try {
-    const { auth_token } = await browser.storage.local.get('auth_token');
-    return !!auth_token;
+    const stored = await browser.storage.local.get(DPOP_KEY_STORAGE_KEY);
+    if (stored[DPOP_KEY_STORAGE_KEY]) {
+      const keyData = stored[DPOP_KEY_STORAGE_KEY];
+      // Re-import the CryptoKey objects
+      const privateKey = await crypto.subtle.importKey(
+        'jwk',
+        keyData.privateKey, // Assuming stored as JWK
+        { name: 'ECDSA', namedCurve: 'P-256' },
+        true, // extractable (needed for storage)
+        ['sign']
+      );
+      // Public key might not need re-import if stored JWK is sufficient
+      return { publicKey: keyData.publicKey, privateKey };
+    }
+
+    // No key found, generate a new one
+    console.log('Generating new DPoP key pair...');
+    const keyPair = await crypto.subtle.generateKey(
+      { name: 'ECDSA', namedCurve: 'P-256' },
+      true, // extractable: required to export and store the private key
+      ['sign', 'verify']
+    );
+
+    // Export keys in JWK format for storage
+    const publicKeyJwk = await crypto.subtle.exportKey('jwk', keyPair.publicKey);
+    const privateKeyJwk = await crypto.subtle.exportKey('jwk', keyPair.privateKey);
+
+    // Remove private key components for the stored public JWK
+    delete publicKeyJwk.d;
+    delete publicKeyJwk.key_ops;
+    publicKeyJwk.key_ops = ['verify']; // Correct key_ops for public key
+
+    // Store the JWK representations
+    await browser.storage.local.set({
+      [DPOP_KEY_STORAGE_KEY]: {
+        publicKey: publicKeyJwk,
+        privateKey: privateKeyJwk, // Store private key as JWK
+      },
+    });
+
+    console.log('Stored new DPoP key pair.');
+    return { publicKey: publicKeyJwk, privateKey: keyPair.privateKey };
+
   } catch (error) {
-    console.error('Error checking authentication:', error);
-    return false;
+    console.error('Error getting/generating DPoP key pair:', error);
+    return null;
   }
 }
 
 /**
- * Store the auth token securely
+ * Generates a DPoP proof JWT.
+ * @param htu The HTTP target URI (RFC9449 Section 4.3)
+ * @param htm The HTTP method (RFC9449 Section 4.3)
+ * @param keyPair The DPoP key pair to sign with.
+ * @param nonce Optional server-provided nonce.
+ * @returns The signed DPoP proof JWT string.
  */
-export async function storeAuthToken(token: string): Promise<void> {
-  await browser.storage.local.set({ 'auth_token': token });
+async function generateDPoPProof(
+  htu: string,
+  htm: string,
+  keyPair: DPoPKeyPair,
+  nonce?: string
+): Promise<string | null> {
+  if (!keyPair) return null;
+
+  try {
+    const header = {
+      typ: 'dpop+jwt',
+      alg: 'ES256',
+      jwk: keyPair.publicKey, // Embed public key JWK
+    };
+
+    const payload: { [key: string]: any } = {
+      jti: generateRandomString(16), // Unique token identifier
+      htm: htm.toUpperCase(),        // HTTP method
+      htu: htu,                      // HTTP target URI
+      iat: Math.floor(Date.now() / 1000), // Issued at timestamp
+    };
+
+    if (nonce) {
+      payload.nonce = nonce;
+    }
+
+    // Encode header and payload
+    const encodedHeader = base64UrlEncode(new TextEncoder().encode(JSON.stringify(header)));
+    const encodedPayload = base64UrlEncode(new TextEncoder().encode(JSON.stringify(payload)));
+
+    // Create signing input
+    const signingInput = `${encodedHeader}.${encodedPayload}`;
+    const signatureInputBuffer = new TextEncoder().encode(signingInput);
+
+    // Sign the input
+    const signatureBuffer = await crypto.subtle.sign(
+      { name: 'ECDSA', hash: { name: 'SHA-256' } },
+      keyPair.privateKey,
+      signatureInputBuffer
+    );
+
+    const encodedSignature = base64UrlEncode(signatureBuffer);
+
+    return `${signingInput}.${encodedSignature}`;
+
+  } catch (error) {
+    console.error('Error generating DPoP proof:', error);
+    return null;
+  }
+}
+
+// --- DPoP Nonce Storage ---
+async function getTokenEndpointNonce(): Promise<string | undefined> {
+  try {
+    const result = await browser.storage.local.get(TOKEN_ENDPOINT_NONCE_KEY);
+    return result[TOKEN_ENDPOINT_NONCE_KEY];
+  } catch (error) {
+    console.error('Error getting token endpoint nonce:', error);
+    return undefined;
+  }
+}
+
+async function storeTokenEndpointNonce(nonce: string): Promise<void> {
+  try {
+    await browser.storage.local.set({ [TOKEN_ENDPOINT_NONCE_KEY]: nonce });
+  } catch (error) {
+    console.error('Error storing token endpoint nonce:', error);
+  }
+}
+
+// --- Authentication Flow Functions --- 
+
+/**
+ * Initiates the Bluesky OAuth flow using browser.identity.launchWebAuthFlow
+ * 
+ * @param handleAuthCallback A function from the background script to handle the redirect result.
+ */
+export async function initiateBlueskyAuth(
+  handleAuthCallback: (redirectUrl?: string) => Promise<void>
+): Promise<{ success: boolean; error?: string }> { // Return type indicates initiation success/failure
+  if (!browser.identity) {
+    console.error('browser.identity API not available.');
+    return { success: false, error: 'Browser identity API not available.' };
+  }
+
+  let resultUrl: string | undefined;
+  try {
+    const state = generateRandomString(32);
+    const codeVerifier = generateRandomString(128);
+    const codeChallenge = await generateCodeChallenge(codeVerifier);
+    const redirectUri = browser.identity.getRedirectURL(); 
+
+    await browser.storage.local.set({
+      auth_state_expected: state,
+      auth_code_verifier: codeVerifier,
+    });
+
+    const authUrl = new URL(BLUESKY_AUTHORIZATION_ENDPOINT);
+    authUrl.searchParams.append('response_type', 'code');
+    authUrl.searchParams.append('client_id', BLUESKY_CLIENT_ID);
+    authUrl.searchParams.append('redirect_uri', redirectUri);
+    authUrl.searchParams.append('scope', 'read write'); // Adjust scopes as needed
+    authUrl.searchParams.append('state', state);
+    authUrl.searchParams.append('code_challenge', codeChallenge);
+    authUrl.searchParams.append('code_challenge_method', 'S256');
+
+    console.log('Initiating auth flow with URL:', authUrl.toString());
+
+    resultUrl = await browser.identity.launchWebAuthFlow({
+      interactive: true,
+      url: authUrl.toString(),
+    });
+
+    // --- Callback Handling --- 
+    // Call the background script's handler function immediately after the flow completes.
+    await handleAuthCallback(resultUrl);
+    // --- End Callback Handling ---
+
+    // The success/failure of the *overall* auth is determined within handleAuthCallback.
+    // This function now only reports if the flow window was launched and returned.
+    if (!resultUrl) {
+      // This case is technically handled by handleAuthCallback(undefined) now,
+      // but we keep the log for clarity.
+      console.log('Auth flow cancelled by user or failed (no result URL).');
+      return { success: false, error: 'Authentication flow cancelled or failed.' };
+    }
+
+    console.log('Auth flow window completed.');
+    return { success: true }; // Indicate flow *initiation* success
+
+  } catch (error) {
+    console.error('Error during Bluesky authentication flow:', error);
+    // Ensure callback is called even on error, potentially with undefined
+    await handleAuthCallback(undefined); 
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error during authentication',
+    };
+  }
 }
 
 /**
- * Get the stored auth token
+ * Exchanges the authorization code for access and refresh tokens.
+ * Includes DPoP proof generation and nonce handling.
  */
-export async function getAuthToken(): Promise<string | null> {
-  const { auth_token } = await browser.storage.local.get('auth_token');
-  return auth_token || null;
+export async function exchangeCodeForToken(
+  code: string,
+  redirectUri: string,
+  codeVerifier: string,
+  retryAttempt = 0 // Add retry count
+): Promise<{ success: boolean; accessToken?: string; refreshToken?: string; error?: string }> {
+  const MAX_DPOP_RETRIES = 1; // Only retry once on nonce error
+
+  const dpopKeyPair = await getDPoPKeyPair();
+  if (!dpopKeyPair) {
+    return { success: false, error: 'Failed to get DPoP key pair.' };
+  }
+  
+  // Get the last known nonce for the token endpoint
+  const currentNonce = await getTokenEndpointNonce();
+  
+  const dpopProof = await generateDPoPProof(
+    BLUESKY_TOKEN_ENDPOINT, 
+    'POST',
+    dpopKeyPair,
+    currentNonce
+  );
+
+  if (!dpopProof) {
+    return { success: false, error: 'Failed to generate DPoP proof.' };
+  }
+
+  try {
+    console.log(`Attempting token exchange (Attempt ${retryAttempt + 1})`);
+    const response = await fetch(BLUESKY_TOKEN_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'DPoP': dpopProof,
+      },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code: code,
+        redirect_uri: redirectUri,
+        client_id: BLUESKY_CLIENT_ID,
+        code_verifier: codeVerifier,
+      }),
+    });
+
+    const newNonce = response.headers.get('DPoP-Nonce');
+    if (newNonce && newNonce !== currentNonce) {
+      console.log('Received new DPoP nonce for token endpoint, storing:', newNonce);
+      await storeTokenEndpointNonce(newNonce);
+    }
+
+    // Handle DPoP nonce error (HTTP 401 use_dpop_nonce)
+    if (response.status === 401 && retryAttempt < MAX_DPOP_RETRIES) {
+       // Check if it's specifically a nonce error (might need to parse body or WWW-Authenticate)
+       // Assuming any 401 here might be a nonce issue for simplicity for now.
+       console.warn(`Token endpoint returned 401. Assuming DPoP nonce issue, retrying with new nonce (${newNonce || 'none'}).`);
+       if (newNonce) {
+         // Retry the request with the new nonce
+         return await exchangeCodeForToken(code, redirectUri, codeVerifier, retryAttempt + 1);
+       } else {
+         console.error('Token endpoint returned 401 but no new DPoP-Nonce header found.');
+         return { success: false, error: 'Authorization failed (status 401) and no new DPoP nonce provided for retry.' };
+       }
+    } else if (response.status === 401) {
+      // Max retries reached or other 401 error
+       console.error(`Token endpoint returned 401 after ${retryAttempt + 1} attempts or for other reason.`);
+       return { success: false, error: 'Authorization failed (status 401).' };
+    }
+
+    // --- Success or other non-401 error ---
+    const responseData = await response.json();
+
+    if (!response.ok) {
+      console.error(`Token exchange failed with status ${response.status}:`, responseData);
+      return { success: false, error: responseData.error_description || responseData.error || `Failed to exchange token (status ${response.status})` };
+    }
+
+    console.log('Token exchange successful:', responseData);
+    // Clear the nonce on successful exchange? Or keep it for potential future use?
+    // Let's keep it for now.
+    return {
+      success: true,
+      accessToken: responseData.access_token,
+      refreshToken: responseData.refresh_token,
+    };
+    
+  } catch (error) {
+    console.error('Network or unexpected error during token exchange:', error);
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown network error during token exchange',
+    };
+  }
 }
 
-/**
- * Clear the auth token (logout)
- */
-export async function logout(): Promise<void> {
-  await browser.storage.local.remove('auth_token');
-} 
+// TODO:
+// - Implement secure token storage (mapping tokens to accounts/dids)
+// - Implement token refresh logic using the refresh token
+// - Replace placeholder client_id and verify endpoints
+// - Integrate this into the background script's callback handling for launchWebAuthFlow 
+
+// --- TODOs ---
+// - Verify if BskyAgent handles DPoP nonces automatically for PDS requests.
+// - Implement preference handling.
+// - Implement remaining TODOs (UI, content script review, etc.).
+// - Thoroughly test the redirect URI flow. 

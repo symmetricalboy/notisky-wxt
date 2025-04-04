@@ -65,5 +65,20 @@ export default defineConfig({
   outDir: 'dist',
   srcDir: '.',
   publicDir: 'public',
-  browser: ['chrome', 'firefox', 'safari']
+  browser: ['chrome', 'firefox', 'safari'],
+  vite: (env) => ({
+    optimizeDeps: {
+      include: [
+        '@atproto/api',
+        '@atproto/did-resolver' // Explicitly include
+      ],
+    },
+    // Remove ssr.noExternal for now
+    // ssr: {
+    //   noExternal: [
+    //     '@atproto/api',
+    //     '@atproto/did-resolver' 
+    //   ],
+    // },
+  })
 });
