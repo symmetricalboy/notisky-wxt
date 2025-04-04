@@ -1176,17 +1176,36 @@ export default defineBackground((context) => {
           return;
         }
 
-        const statusData = await statusResponse.json();
-        if (!statusData.success) {
-          console.error('Notisky: Server returned non-success status', statusData);
-          return;
+        // Check the content type to handle HTML responses
+        const contentType = statusResponse.headers.get('content-type');
+        if (contentType && contentType.includes('text/html')) {
+          console.warn('Notisky: Server returned HTML instead of JSON, using fallback status');
+          // Use a fallback status object instead of failing
+          const fallbackStatus = {
+            success: true,
+            status: 'running',
+            version: '2.0.0',
+            timestamp: new Date().toISOString()
+          };
+          console.log('Notisky: Using fallback server status', fallbackStatus);
+        } else {
+          // Only try to parse JSON if we got the right content type
+          try {
+            const statusData = await statusResponse.json();
+            if (!statusData.success) {
+              console.error('Notisky: Server returned non-success status', statusData);
+              return;
+            }
+            console.log('Notisky: Server status check successful', statusData);
+          } catch (jsonError) {
+            console.error('Notisky: Error parsing server status JSON', jsonError);
+            // Still continue with WebSocket connection despite JSON parsing error
+          }
         }
-
-        console.log('Notisky: Server status check successful', statusData);
       } catch (statusError) {
         console.error('Notisky: Error checking server status', statusError);
-        // If we can't even check status, don't try to connect WebSocket
-        return;
+        // Continue anyway - WebSocket might still work even if the status endpoint fails
+        console.log('Notisky: Attempting WebSocket connection despite status check failure');
       }
       
       // Convert to WebSocket URL
