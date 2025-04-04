@@ -141,16 +141,22 @@ async function alternativeAuthFlow(authUrl: string, state: string): Promise<Auth
     // Register the message listener
     browser.runtime.onMessage.addListener(messageListener);
     
-    // Open the auth URL in a new tab and add a notification to help users understand what to do
-    browser.notifications.create({
-      type: 'basic',
-      iconUrl: '/icon48.png',
-      title: 'Notisky Authentication',
-      message: 'A new tab has been opened for authentication. Please complete the process there.'
-    }).catch(err => console.error('Could not create notification:', err));
+    // Skip notification and just create a new tab with the auth URL
+    console.log('Opening auth URL in new tab:', authUrl);
+    
+    // Add the extension identifier to the URL to help the auth page detect the extension
+    const enhancedAuthUrl = new URL(authUrl);
+    enhancedAuthUrl.searchParams.append('client_mode', 'extension_tab');
     
     // Open the auth URL in a new tab
-    browser.tabs.create({ url: authUrl });
+    browser.tabs.create({ url: enhancedAuthUrl.toString() })
+      .catch(error => {
+        console.error('Error opening auth tab:', error);
+        resolve({
+          success: false,
+          error: 'Failed to open authentication tab'
+        });
+      });
     
     // Set a timeout to clean up if no response is received
     setTimeout(() => {
