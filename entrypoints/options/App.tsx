@@ -6,7 +6,6 @@ interface UserPreferences {
   enableNotifications: boolean;
   keepPageAlive: boolean;
   refreshInterval: number;
-  useNotificationServer: boolean;
   notificationServerUrl: string;
   notificationServerUserId: string;
 }
@@ -17,8 +16,7 @@ const defaultPreferences: UserPreferences = {
   enableNotifications: true,
   keepPageAlive: true,
   refreshInterval: 1,
-  useNotificationServer: false,
-  notificationServerUrl: '',
+  notificationServerUrl: 'https://notisky.symm.app',
   notificationServerUserId: ''
 };
 
@@ -27,20 +25,18 @@ const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<string>('preferences');
   const [statusMessage, setStatusMessage] = useState<{ text: string, type: string } | null>(null);
   const [serverStatus, setServerStatus] = useState<'checking' | 'connected' | 'error'>('checking');
+  const [accountsInfo, setAccountsInfo] = useState<any[]>([]);
 
   // Load preferences when component mounts
   useEffect(() => {
     loadPreferences();
+    fetchLinkedAccounts();
   }, []);
 
-  // Check server connection when preferences change
+  // Check server connection when component mounts
   useEffect(() => {
-    if (preferences.useNotificationServer && 
-        preferences.notificationServerUrl && 
-        preferences.notificationServerUserId) {
-      checkServerConnection();
-    }
-  }, [preferences.useNotificationServer, preferences.notificationServerUrl, preferences.notificationServerUserId]);
+    checkServerConnection();
+  }, []);
 
   // Function to load user preferences
   const loadPreferences = async () => {
@@ -72,41 +68,33 @@ const App: React.FC = () => {
     }
   };
 
+  // Fetch accounts linked to this extension
+  const fetchLinkedAccounts = async () => {
+    try {
+      const { accounts = [] } = await browser.storage.local.get('accounts');
+      setAccountsInfo(accounts);
+    } catch (error) {
+      console.error('Error fetching linked accounts:', error);
+    }
+  };
+
   // Check connection to notification server
   const checkServerConnection = async () => {
-    if (!preferences.notificationServerUrl) {
-      setServerStatus('not-configured');
-      return;
-    }
-
     setServerStatus('checking');
 
     try {
-      // Ensure URL has correct format
-      let url = preferences.notificationServerUrl;
-      if (!url.startsWith('http://') && !url.startsWith('https://')) {
-        url = `https://${url}`;
-      }
+      // Use the fixed Vercel deployment URL
+      const url = 'https://notisky.symm.app';
       
-      // Remove trailing slash if present
-      if (url.endsWith('/')) {
-        url = url.slice(0, -1);
-      }
-      
-      // Attempt to fetch server status with more robust error handling
+      // Attempt to fetch server status
       const response = await fetch(`${url}/api/status`, {
         method: 'GET',
         headers: {
           'Content-Type': 'application/json'
         },
-        // Add mode: 'cors' to explicitly request CORS 
         mode: 'cors'
       }).catch(error => {
         console.error('Fetch error:', error);
-        // Check if this is a CORS-related error
-        if (error.toString().includes('CORS') || error.toString().includes('blocked by CORS')) {
-          throw new Error('CORS error - The server is not configured to accept requests from this extension');
-        }
         throw error;
       });
       
@@ -114,15 +102,11 @@ const App: React.FC = () => {
         const data = await response.json();
         if (data.success) {
           setServerStatus('connected');
-          
-          // Save normalized URL
-          if (url !== preferences.notificationServerUrl) {
-            setPreferences({
-              ...preferences,
-              notificationServerUrl: url
-            });
-          }
-          
+          // Save the URL in preferences
+          setPreferences(prev => ({
+            ...prev,
+            notificationServerUrl: url
+          }));
           return;
         } else {
           console.error('Server returned non-success status:', data);
@@ -154,12 +138,17 @@ const App: React.FC = () => {
     });
   };
 
+  // Open auth portal in new tab
+  const openAuthPortal = () => {
+    browser.tabs.create({ url: 'https://notisky.symm.app' });
+  };
+
   return (
     <div className="container">
-      <h1>
-        <img src="../assets/icons/icon48.png" alt="Notisky Logo" />
-        Notisky Notifications Options
-      </h1>
+      <header className="app-header">
+        <img src="../assets/icons/icon48.png" alt="Notisky Logo" className="logo" />
+        <h1>Notisky Notifications</h1>
+      </header>
 
       <div className="tab-navigation">
         <div 
@@ -169,10 +158,10 @@ const App: React.FC = () => {
           Preferences
         </div>
         <div 
-          className={`tab ${activeTab === 'server' ? 'active' : ''}`}
-          onClick={() => setActiveTab('server')}
+          className={`tab ${activeTab === 'accounts' ? 'active' : ''}`}
+          onClick={() => setActiveTab('accounts')}
         >
-          Notification Server
+          Accounts
         </div>
         <div 
           className={`tab ${activeTab === 'about' ? 'active' : ''}`}
@@ -244,24 +233,9 @@ const App: React.FC = () => {
               <span className="slider"></span>
             </label>
           </div>
-          
-          <div className="toggle-option">
-            <div>
-              <div className="option-label">Use Notification Server</div>
-              <div className="option-description">Connect to a notification server for real-time multi-account updates</div>
-            </div>
-            <label className="toggle-switch">
-              <input
-                type="checkbox"
-                checked={preferences.useNotificationServer}
-                onChange={(e) => handlePreferenceChange('useNotificationServer', e.target.checked)}
-              />
-              <span className="slider"></span>
-            </label>
-          </div>
         </div>
 
-        <div className={`input-group ${preferences.keepPageAlive && !preferences.useNotificationServer ? 'visible' : ''}`}>
+        <div className="input-group visible">
           <label htmlFor="refresh-interval">Check Interval (minutes)</label>
           <input
             type="number"
@@ -274,7 +248,7 @@ const App: React.FC = () => {
         </div>
 
         <div className="action-buttons">
-          <button onClick={savePreferences}>Save Preferences</button>
+          <button onClick={savePreferences} className="primary-button">Save Preferences</button>
         </div>
 
         {statusMessage && (
@@ -284,59 +258,46 @@ const App: React.FC = () => {
         )}
       </div>
       
-      <div className={`tab-content ${activeTab === 'server' ? 'active' : ''}`} id="server-tab">
-        <h2>Notification Server</h2>
-        <p className="server-description">
-          Connect to a Notisky notification server to get real-time notifications from multiple Bluesky accounts.
-        </p>
+      <div className={`tab-content ${activeTab === 'accounts' ? 'active' : ''}`} id="accounts-tab">
+        <h2>Bluesky Accounts</h2>
         
-        <div className="server-settings">
-          <div className="form-group">
-            <label htmlFor="server-url">Server URL</label>
-            <input
-              type="text"
-              id="server-url"
-              placeholder="https://yourserver.com"
-              value={preferences.notificationServerUrl}
-              onChange={(e) => handlePreferenceChange('notificationServerUrl', e.target.value)}
-              disabled={!preferences.useNotificationServer}
-            />
+        <div className="accounts-section">
+          <div className="server-status-banner">
+            <div className={`status-indicator ${serverStatus}`}>
+              {serverStatus === 'checking' && 'Checking connection to Notisky server...'}
+              {serverStatus === 'connected' && 'Connected to Notisky authentication server'}
+              {serverStatus === 'error' && 'Error connecting to Notisky server'}
+            </div>
           </div>
           
-          <div className="form-group">
-            <label htmlFor="server-userid">User ID</label>
-            <input
-              type="text"
-              id="server-userid"
-              placeholder="Your user ID from the notification server"
-              value={preferences.notificationServerUserId}
-              onChange={(e) => handlePreferenceChange('notificationServerUserId', e.target.value)}
-              disabled={!preferences.useNotificationServer}
-            />
-          </div>
+          {accountsInfo.length > 0 ? (
+            <div className="accounts-list">
+              <h3>Connected Accounts</h3>
+              {accountsInfo.map((account, index) => (
+                <div key={index} className="account-card">
+                  <div className="account-info">
+                    <div className="account-handle">@{account.handle}</div>
+                    <div className="account-did">{account.did}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="no-accounts">
+              <p>No accounts connected yet.</p>
+            </div>
+          )}
           
-          <div className="server-status">
-            <span className="status-label">Server Status:</span>
-            <span className={`status-indicator ${serverStatus}`}>
-              {serverStatus === 'checking' && 'Checking connection...'}
-              {serverStatus === 'connected' && 'Connected'}
-              {serverStatus === 'error' && 'Connection error'}
-            </span>
-          </div>
-          
-          <div className="action-buttons">
-            <button 
-              onClick={checkServerConnection}
-              disabled={!preferences.useNotificationServer || !preferences.notificationServerUrl}
-            >
-              Test Connection
+          <div className="auth-actions">
+            <button onClick={openAuthPortal} className="primary-button">
+              Manage Accounts in Auth Portal
             </button>
-            <button onClick={savePreferences}>Save Settings</button>
           </div>
           
-          <div className="server-info">
+          <div className="accounts-help">
             <p>
-              Don't have a server? Check the <a href="https://github.com/dylanpdx/notisky" target="_blank">Notisky GitHub repository</a> for instructions on setting up your own notification server.
+              Notisky uses the Authentication Portal to securely manage your Bluesky accounts.
+              You can connect multiple accounts to receive real-time notifications from all of them.
             </p>
           </div>
         </div>
@@ -362,9 +323,27 @@ const App: React.FC = () => {
           <li>Display notification count on the Bluesky tab favicon</li>
           <li>Background notification checking</li>
           <li>Desktop notifications</li>
-          <li>Real-time multi-account notifications via notification server</li>
+          <li>Real-time multi-account notifications via Notisky server</li>
         </ul>
+        
+        <div className="auth-actions">
+          <a href="https://notisky.symm.app" target="_blank" rel="noopener noreferrer" className="secondary-button">
+            Visit Auth Portal
+          </a>
+          <a href="https://github.com/symmetricalboy/notisky" target="_blank" rel="noopener noreferrer" className="secondary-button">
+            GitHub Repository
+          </a>
+        </div>
       </div>
+      
+      <footer className="app-footer">
+        <p className="footer-slogan">Free & open source, for all, forever.</p>
+        <p className="footer-contact">
+          Feedback, suggestions, assistance, & updates:
+          <a href="https://bsky.app/profile/symm.app" target="_blank" rel="noopener noreferrer">@symm.app</a>
+        </p>
+        <p className="footer-copyright">Copyright (c) 2025 Dylan Gregori Singer (symmetricalboy)</p>
+      </footer>
     </div>
   );
 };

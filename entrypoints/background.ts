@@ -39,12 +39,13 @@ export default defineBackground((context) => {
     userId: string;
   }
   
-  // WebSocket connection for auth server (only for authentication now)
+  // WebSocket connection for auth server
   let wsConnection: WebSocket | null = null;
   let wsReconnectTimer: number | null = null;
   let wsConnectionAttempts = 0;
   const MAX_RECONNECT_ATTEMPTS = 5;
   const RECONNECT_DELAY = 5000; // 5 seconds
+  const AUTH_SERVER_URL = 'https://notisky.symm.app';
 
   // Check if we're in a real browser environment (vs. build environment)
   const isRealBrowser = (() => {
@@ -247,6 +248,7 @@ export default defineBackground((context) => {
     enableNotifications: boolean;
     keepPageAlive: boolean;
     refreshInterval: number;
+    notificationServerUserId: string;
   }
 
   // Global variable to store user preferences
@@ -255,7 +257,8 @@ export default defineBackground((context) => {
     updateExtensionIcon: true,
     enableNotifications: true,
     keepPageAlive: true, 
-    refreshInterval: 1 // Default to 1 minute
+    refreshInterval: 1, // Default to 1 minute
+    notificationServerUserId: ''
   };
 
   // Load user preferences
@@ -271,7 +274,8 @@ export default defineBackground((context) => {
         updateExtensionIcon: true,
         enableNotifications: true,
         keepPageAlive: true,
-        refreshInterval: 1
+        refreshInterval: 1,
+        notificationServerUserId: ''
       }).then((items) => {
         userPreferences = items as UserPreferences;
         console.log('Notisky: Loaded user preferences', userPreferences);
@@ -1137,16 +1141,9 @@ export default defineBackground((context) => {
     }
   }
 
-  // UPDATE setupWebSocketConnection to only handle authentication
+  // UPDATE setupWebSocketConnection to use the fixed Auth Server URL
   async function setupWebSocketConnection() {
-    // Get preferences to check if notification server is enabled
     try {
-      const preferences = await browser.storage.sync.get({
-        useNotificationServer: false,
-        notificationServerUrl: '',
-        notificationServerUserId: ''
-      });
-      
       // Close existing WebSocket if there is one
       if (wsConnection) {
         console.log('Notisky: Closing existing WebSocket connection');
@@ -1163,29 +1160,10 @@ export default defineBackground((context) => {
       // Reset connection attempts
       wsConnectionAttempts = 0;
       
-      // If notification server is not enabled or URL/userId is not set, do nothing
-      if (!preferences.useNotificationServer || 
-          !preferences.notificationServerUrl ||
-          !preferences.notificationServerUserId) {
-        console.log('Notisky: Notification server not configured, skipping WebSocket connection');
-        return;
-      }
-      
-      // Ensure URL has correct format
-      let serverUrl = preferences.notificationServerUrl;
-      if (!serverUrl.startsWith('http://') && !serverUrl.startsWith('https://')) {
-        serverUrl = `https://${serverUrl}`;
-      }
-      
-      // Remove trailing slash if present
-      if (serverUrl.endsWith('/')) {
-        serverUrl = serverUrl.slice(0, -1);
-      }
-
-      // First check if the server is available and accepts our requests
+      // Check server status first
       try {
-        console.log(`Notisky: Checking server status at ${serverUrl}/api/status`);
-        const statusResponse = await fetch(`${serverUrl}/api/status`, {
+        console.log(`Notisky: Checking server status at ${AUTH_SERVER_URL}/api/status`);
+        const statusResponse = await fetch(`${AUTH_SERVER_URL}/api/status`, {
           method: 'GET',
           headers: {
             'Content-Type': 'application/json'
@@ -1212,22 +1190,27 @@ export default defineBackground((context) => {
       }
       
       // Convert to WebSocket URL
-      const wsUrl = serverUrl.replace(/^http/, 'ws') + '/';
+      const wsUrl = AUTH_SERVER_URL.replace(/^http/, 'ws') + '/';
       
       try {
         // Connect to WebSocket server
         console.log(`Notisky: Connecting to WebSocket server at ${wsUrl}`);
         wsConnection = new WebSocket(wsUrl);
         
+        // Get the userId from storage
+        const { notificationServerUserId = '' } = await browser.storage.sync.get({
+          notificationServerUserId: ''
+        });
+        
         // Set up WebSocket event handlers
         wsConnection.onopen = () => {
           console.log('Notisky: WebSocket connection established');
           wsConnectionAttempts = 0;
           
-          // Subscribe to accounts for this user (but now we'll use it only to get new accounts)
+          // Subscribe to accounts for this user
           sendWebSocketMessage({
             type: 'subscribe',
-            userId: preferences.notificationServerUserId,
+            userId: notificationServerUserId,
             accounts: [] // Server will send account details associated with this user
           });
         };
@@ -1277,7 +1260,7 @@ export default defineBackground((context) => {
         console.error('Notisky: Error setting up WebSocket connection', error);
       }
     } catch (error) {
-      console.error('Notisky: Error getting notification server preferences', error);
+      console.error('Notisky: Error in setupWebSocketConnection', error);
     }
   }
   
@@ -1322,8 +1305,54 @@ export default defineBackground((context) => {
     }
   }
 
-  // Initialize local polling when extension loads
-  initHeadlessClients();
+  // Main initialization
+  function initialize() {
+    console.log('Notisky: Initializing background script');
+    
+    // Load user preferences
+    loadUserPreferences();
+    
+    // Set up heartbeat alarm for context persistence detection
+    if (isRealBrowser && browser.alarms) {
+      try {
+        browser.alarms.create('notiskyHeartbeat', {
+          periodInMinutes: 1
+        });
+      } catch (error) {
+        console.error('Notisky: Error creating alarm', error);
+      }
+    }
+    
+    // Always try to connect to the auth server
+    setupWebSocketConnection();
+    
+    // Set up an alarm to periodically try reconnecting if needed
+    if (isRealBrowser && browser.alarms) {
+      try {
+        browser.alarms.create('notiskyServerConnect', {
+          periodInMinutes: 5 // Check every 5 minutes
+        });
+        
+        browser.alarms.onAlarm.addListener((alarm) => {
+          if (alarm.name === 'notiskyServerConnect') {
+            // If we don't have an active connection, try to reconnect
+            if (!wsConnection) {
+              console.log('Notisky: No active WebSocket connection, attempting to reconnect');
+              setupWebSocketConnection();
+            }
+          }
+        });
+      } catch (error) {
+        console.error('Notisky: Error creating server connection alarm', error);
+      }
+    }
+    
+    // Initialize headless clients for any existing accounts
+    initHeadlessClients();
+  }
+  
+  // Call initialize on start
+  initialize();
 
   // Listen for preference updates
   browser.runtime.onMessage.addListener((message, sender, sendResponse) => {

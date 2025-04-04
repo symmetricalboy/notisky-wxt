@@ -8,38 +8,120 @@ interface CountInfo {
   total: number;
 }
 
+interface AccountInfo {
+  did: string;
+  handle: string;
+  accessJwt: string;
+  refreshJwt: string;
+  userId: string;
+  counts?: CountInfo;
+}
+
 function App() {
-  const [counts, setCounts] = useState<CountInfo>({ notification: 0, message: 0, total: 0 });
+  const [accounts, setAccounts] = useState<AccountInfo[]>([]);
   const [loading, setLoading] = useState(true);
+  const [serverConnected, setServerConnected] = useState<boolean>(false);
 
   useEffect(() => {
-    // Function to get current notification counts
-    const getCounts = async () => {
+    // Load accounts and notification data
+    const loadData = async () => {
       try {
         setLoading(true);
+        
+        // Check if we have a connection to the auth server
+        const checkServerConnection = async () => {
+          try {
+            const response = await fetch('https://notisky.symm.app/api/status', {
+              method: 'GET',
+              headers: {
+                'Content-Type': 'application/json'
+              },
+              mode: 'cors'
+            });
+            
+            if (response.ok) {
+              const data = await response.json();
+              setServerConnected(data.success === true);
+            } else {
+              setServerConnected(false);
+            }
+          } catch (error) {
+            console.error('Error checking server connection:', error);
+            setServerConnected(false);
+          }
+        };
+        
+        // Get the accounts from storage
+        const { accounts = [] } = await browser.storage.local.get('accounts');
+        
         // Check active tab if it's a Bluesky tab
         const tabs = await browser.tabs.query({ active: true, currentWindow: true });
         const currentTab = tabs[0];
         
         if (currentTab?.url && (currentTab.url.includes('bsky.app') || currentTab.url.includes('bsky.social'))) {
           // This is a Bluesky tab - request a fresh count
-          const response = await browser.tabs.sendMessage(currentTab.id!, { action: 'checkForUpdates' });
-          console.log('Response from content script:', response);
+          try {
+            await browser.tabs.sendMessage(currentTab.id!, { action: 'checkForUpdates' });
+          } catch (error) {
+            console.log('Unable to refresh counts from Bluesky tab:', error);
+          }
         }
         
         // Get the currently cached counts from storage
-        const storage = await browser.storage.local.get('notificationCounts');
-        if (storage.notificationCounts) {
-          setCounts(storage.notificationCounts);
+        const storage = await browser.storage.local.get(['notificationCounts', 'accountNotifications']);
+        
+        // Map the counts to the appropriate accounts if we have account-specific notifications
+        if (storage.accountNotifications && Array.isArray(storage.accountNotifications)) {
+          const accountsWithCounts = accounts.map(account => {
+            const accountNotifications = storage.accountNotifications.find(
+              (an: any) => an.did === account.did
+            );
+            
+            return {
+              ...account,
+              counts: accountNotifications ? {
+                notification: accountNotifications.notification || 0,
+                message: accountNotifications.message || 0,
+                total: (accountNotifications.notification || 0) + (accountNotifications.message || 0)
+              } : {
+                notification: 0,
+                message: 0,
+                total: 0
+              }
+            };
+          });
+          
+          setAccounts(accountsWithCounts);
+        } else {
+          // Fallback to using the global counts if we don't have account-specific ones
+          const globalCounts = storage.notificationCounts || { notification: 0, message: 0, total: 0 };
+          
+          if (accounts.length > 0) {
+            // If we have one account, assign the global counts to it
+            if (accounts.length === 1) {
+              setAccounts([{
+                ...accounts[0],
+                counts: globalCounts
+              }]);
+            } else {
+              // Otherwise just set the accounts without counts
+              setAccounts(accounts);
+            }
+          } else {
+            setAccounts([]);
+          }
         }
+        
+        // Check server connection
+        await checkServerConnection();
       } catch (error) {
-        console.error('Error fetching notification counts:', error);
+        console.error('Error loading data:', error);
       } finally {
         setLoading(false);
       }
     };
     
-    getCounts();
+    loadData();
   }, []);
 
   const openBluesky = (path: string) => {
@@ -49,6 +131,11 @@ function App() {
 
   const openOptions = () => {
     browser.runtime.openOptionsPage();
+    window.close();
+  };
+  
+  const openAuthPortal = () => {
+    browser.tabs.create({ url: 'https://notisky.symm.app' });
     window.close();
   };
 
@@ -70,35 +157,66 @@ function App() {
           <p>Checking for notifications...</p>
         </div>
       ) : (
-        <div className="notification-summary">
-          <div className="count-container">
-            <div className="count-item badge-container" onClick={() => openBluesky('/notifications')}>
-              <div className="count-label">Notifications</div>
-              {counts.notification > 0 && (
-                <div className={getBadgeClass(counts.notification)}>
-                  {counts.notification > 99 ? '99+' : counts.notification}
+        <>
+          {accounts.length > 0 ? (
+            <div className="accounts-container">
+              {accounts.map((account, index) => (
+                <div key={index} className="account-card">
+                  <div className="account-header">
+                    <span className="account-handle">@{account.handle}</span>
+                  </div>
+                  
+                  <div className="notification-summary">
+                    <div className="count-container">
+                      <div 
+                        className="count-item badge-container" 
+                        onClick={() => openBluesky(`/profile/${account.handle}/notifications`)}
+                      >
+                        <div className="count-label">Notifications</div>
+                        {account.counts && account.counts.notification > 0 && (
+                          <div className={getBadgeClass(account.counts.notification)}>
+                            {account.counts.notification > 99 ? '99+' : account.counts.notification}
+                          </div>
+                        )}
+                      </div>
+                      <div 
+                        className="count-item badge-container" 
+                        onClick={() => openBluesky('/messages')}
+                      >
+                        <div className="count-label">Messages</div>
+                        {account.counts && account.counts.message > 0 && (
+                          <div className={getBadgeClass(account.counts.message)}>
+                            {account.counts.message > 99 ? '99+' : account.counts.message}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                    
+                    <div className="total-count badge-container">
+                      <span>Total:</span> 
+                      {account.counts && account.counts.total > 0 && (
+                        <div className={getBadgeClass(account.counts.total)}>
+                          {account.counts.total > 99 ? '99+' : account.counts.total}
+                        </div>
+                      )}
+                    </div>
+                  </div>
                 </div>
-              )}
+              ))}
             </div>
-            <div className="count-item badge-container" onClick={() => openBluesky('/messages')}>
-              <div className="count-label">Messages</div>
-              {counts.message > 0 && (
-                <div className={getBadgeClass(counts.message)}>
-                  {counts.message > 99 ? '99+' : counts.message}
-                </div>
-              )}
+          ) : (
+            <div className="no-accounts">
+              <p>No Bluesky accounts connected.</p>
+              <p>Connect your accounts through the Auth Portal.</p>
             </div>
-          </div>
+          )}
           
-          <div className="total-count badge-container">
-            <span>Total:</span> 
-            {counts.total > 0 && (
-              <div className={getBadgeClass(counts.total)}>
-                {counts.total > 99 ? '99+' : counts.total}
-              </div>
-            )}
+          <div className="server-status">
+            <div className={`status-indicator ${serverConnected ? 'connected' : 'error'}`}>
+              {serverConnected ? 'Connected to Auth Server' : 'Not connected to Auth Server'}
+            </div>
           </div>
-        </div>
+        </>
       )}
       
       <div className="popup-actions">
@@ -110,11 +228,26 @@ function App() {
         </button>
         <button 
           className="action-button secondary"
+          onClick={openAuthPortal}
+        >
+          Auth Portal
+        </button>
+        <button 
+          className="action-button secondary"
           onClick={openOptions}
         >
           Options
         </button>
       </div>
+      
+      <footer className="popup-footer">
+        <p className="footer-slogan">Free & open source, for all, forever.</p>
+        <p className="footer-contact">
+          Feedback, suggestions, assistance, & updates:
+          <a href="#" onClick={(e) => { e.preventDefault(); openBluesky('/profile/symm.app'); }}>@symm.app</a>
+        </p>
+        <p className="footer-copyright">Copyright (c) 2025 Dylan Gregori Singer (symmetricalboy)</p>
+      </footer>
     </div>
   );
 }
