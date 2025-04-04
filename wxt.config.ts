@@ -19,7 +19,8 @@ export default defineConfig({
     ],
     host_permissions: [
       '*://bsky.app/*',
-      '*://*.bsky.social/*'
+      '*://*.bsky.social/*',
+      '*://notisky-auth.vercel.app/*'
     ],
     web_accessible_resources: [
       {

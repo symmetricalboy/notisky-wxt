@@ -1181,6 +1181,35 @@ export default defineBackground((context) => {
       if (serverUrl.endsWith('/')) {
         serverUrl = serverUrl.slice(0, -1);
       }
+
+      // First check if the server is available and accepts our requests
+      try {
+        console.log(`Notisky: Checking server status at ${serverUrl}/api/status`);
+        const statusResponse = await fetch(`${serverUrl}/api/status`, {
+          method: 'GET',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          mode: 'cors'
+        });
+
+        if (!statusResponse.ok) {
+          console.error(`Notisky: Server returned error status: ${statusResponse.status}`);
+          return;
+        }
+
+        const statusData = await statusResponse.json();
+        if (!statusData.success) {
+          console.error('Notisky: Server returned non-success status', statusData);
+          return;
+        }
+
+        console.log('Notisky: Server status check successful', statusData);
+      } catch (statusError) {
+        console.error('Notisky: Error checking server status', statusError);
+        // If we can't even check status, don't try to connect WebSocket
+        return;
+      }
       
       // Convert to WebSocket URL
       const wsUrl = serverUrl.replace(/^http/, 'ws') + '/';

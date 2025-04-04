@@ -75,7 +75,7 @@ const App: React.FC = () => {
   // Check connection to notification server
   const checkServerConnection = async () => {
     if (!preferences.notificationServerUrl) {
-      setServerStatus('error');
+      setServerStatus('not-configured');
       return;
     }
 
@@ -93,12 +93,21 @@ const App: React.FC = () => {
         url = url.slice(0, -1);
       }
       
-      // Attempt to fetch server status
+      // Attempt to fetch server status with more robust error handling
       const response = await fetch(`${url}/api/status`, {
         method: 'GET',
         headers: {
           'Content-Type': 'application/json'
+        },
+        // Add mode: 'cors' to explicitly request CORS 
+        mode: 'cors'
+      }).catch(error => {
+        console.error('Fetch error:', error);
+        // Check if this is a CORS-related error
+        if (error.toString().includes('CORS') || error.toString().includes('blocked by CORS')) {
+          throw new Error('CORS error - The server is not configured to accept requests from this extension');
         }
+        throw error;
       });
       
       if (response.ok) {
@@ -115,10 +124,14 @@ const App: React.FC = () => {
           }
           
           return;
+        } else {
+          console.error('Server returned non-success status:', data);
+          setServerStatus('error');
         }
+      } else {
+        console.error('Server returned error status:', response.status);
+        setServerStatus('error');
       }
-      
-      setServerStatus('error');
     } catch (error) {
       console.error('Error connecting to notification server:', error);
       setServerStatus('error');
