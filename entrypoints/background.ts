@@ -46,6 +46,12 @@ export default defineBackground((context) => {
   const MAX_RECONNECT_ATTEMPTS = 5;
   const RECONNECT_DELAY = 5000; // 5 seconds
   const AUTH_SERVER_URL = 'https://notisky.symm.app';
+  const AUTH_SERVER_WS_URL = 'wss://notisky-auth.vercel.app'; // Primary fallback WebSocket URL
+  const ALTERNATE_WS_URLS = [
+    'wss://notisky-auth.vercel.app',   // Primary WebSocket URL
+    'wss://notisky-auth-server.vercel.app'  // Alternative WebSocket URL
+  ];
+  let wsUrlIndex = 0; // Track which WebSocket URL we're trying
 
   // Check if we're in a real browser environment (vs. build environment)
   const isRealBrowser = (() => {
@@ -1141,6 +1147,26 @@ export default defineBackground((context) => {
     }
   }
 
+  // Helper function to send WebSocket messages safely
+  function sendWebSocketMessage(message: any) {
+    try {
+      if (wsConnection && wsConnection.readyState === WebSocket.OPEN) {
+        wsConnection.send(JSON.stringify(message));
+        return true;
+      } else {
+        console.error('Notisky: WebSocket not open, cannot send message');
+        // Attempt to reconnect if no connection
+        if (!wsConnection || wsConnection.readyState === WebSocket.CLOSED) {
+          setupWebSocketConnection();
+        }
+        return false;
+      }
+    } catch (error) {
+      console.error('Notisky: Error sending WebSocket message', error);
+      return false;
+    }
+  }
+
   // UPDATE setupWebSocketConnection to use the fixed Auth Server URL
   async function setupWebSocketConnection() {
     try {
@@ -1157,10 +1183,16 @@ export default defineBackground((context) => {
         wsReconnectTimer = null;
       }
       
-      // Reset connection attempts
-      wsConnectionAttempts = 0;
+      // Reset connection attempts if we've cycled through all URLs
+      if (wsConnectionAttempts >= MAX_RECONNECT_ATTEMPTS) {
+        wsConnectionAttempts = 0;
+        wsUrlIndex = (wsUrlIndex + 1) % ALTERNATE_WS_URLS.length; // Try next URL in rotation
+      }
       
-      // Check server status first
+      // Initialize with fallback WebSocket URL
+      let wsUrl = AUTH_SERVER_WS_URL;
+      
+      // Check server status first to get the proper WebSocket URL
       try {
         console.log(`Notisky: Checking server status at ${AUTH_SERVER_URL}/api/status`);
         const statusResponse = await fetch(`${AUTH_SERVER_URL}/api/status`, {
@@ -1173,43 +1205,46 @@ export default defineBackground((context) => {
 
         if (!statusResponse.ok) {
           console.error(`Notisky: Server returned error status: ${statusResponse.status}`);
-          return;
-        }
-
-        // Check the content type to handle HTML responses
-        const contentType = statusResponse.headers.get('content-type');
-        if (contentType && contentType.includes('text/html')) {
-          console.warn('Notisky: Server returned HTML instead of JSON, using fallback status');
-          // Use a fallback status object instead of failing
-          const fallbackStatus = {
-            success: true,
-            status: 'running',
-            version: '2.0.0',
-            timestamp: new Date().toISOString()
-          };
-          console.log('Notisky: Using fallback server status', fallbackStatus);
+          console.log('Notisky: Using fallback WebSocket URL:', ALTERNATE_WS_URLS[wsUrlIndex]);
+          wsUrl = ALTERNATE_WS_URLS[wsUrlIndex];
         } else {
-          // Only try to parse JSON if we got the right content type
-          try {
-            const statusData = await statusResponse.json();
-            if (!statusData.success) {
-              console.error('Notisky: Server returned non-success status', statusData);
-              return;
+          // Check the content type to handle HTML responses
+          const contentType = statusResponse.headers.get('content-type');
+          if (contentType && contentType.includes('text/html')) {
+            console.warn('Notisky: Server returned HTML instead of JSON, using fallback status');
+            console.log('Notisky: Using fallback WebSocket URL:', ALTERNATE_WS_URLS[wsUrlIndex]);
+            wsUrl = ALTERNATE_WS_URLS[wsUrlIndex];
+          } else {
+            // Only try to parse JSON if we got the right content type
+            try {
+              const statusData = await statusResponse.json();
+              if (!statusData.success) {
+                console.error('Notisky: Server returned non-success status', statusData);
+                wsUrl = ALTERNATE_WS_URLS[wsUrlIndex];
+              } else {
+                console.log('Notisky: Server status check successful', statusData);
+                
+                // Use the WebSocket URL from the status response if available
+                if (statusData.serverUrl) {
+                  wsUrl = statusData.serverUrl;
+                  console.log('Notisky: Using WebSocket URL from status API:', wsUrl);
+                } else {
+                  console.log('Notisky: Status API did not provide serverUrl, using fallback URL:', ALTERNATE_WS_URLS[wsUrlIndex]);
+                  wsUrl = ALTERNATE_WS_URLS[wsUrlIndex];
+                }
+              }
+            } catch (jsonError) {
+              console.error('Notisky: Error parsing server status JSON', jsonError);
+              console.log('Notisky: Using fallback WebSocket URL:', ALTERNATE_WS_URLS[wsUrlIndex]);
+              wsUrl = ALTERNATE_WS_URLS[wsUrlIndex];
             }
-            console.log('Notisky: Server status check successful', statusData);
-          } catch (jsonError) {
-            console.error('Notisky: Error parsing server status JSON', jsonError);
-            // Still continue with WebSocket connection despite JSON parsing error
           }
         }
       } catch (statusError) {
         console.error('Notisky: Error checking server status', statusError);
-        // Continue anyway - WebSocket might still work even if the status endpoint fails
-        console.log('Notisky: Attempting WebSocket connection despite status check failure');
+        console.log('Notisky: Using fallback WebSocket URL:', ALTERNATE_WS_URLS[wsUrlIndex]);
+        wsUrl = ALTERNATE_WS_URLS[wsUrlIndex];
       }
-      
-      // Convert to WebSocket URL
-      const wsUrl = AUTH_SERVER_URL.replace(/^http/, 'ws') + '/';
       
       try {
         // Connect to WebSocket server
@@ -1220,11 +1255,26 @@ export default defineBackground((context) => {
         const { notificationServerUserId = '' } = await browser.storage.sync.get({
           notificationServerUserId: ''
         });
+      
+        // Set connection timeout
+        const connectionTimeout = setTimeout(() => {
+          if (wsConnection && wsConnection.readyState !== WebSocket.OPEN) {
+            console.error('Notisky: WebSocket connection timeout');
+            wsConnection.close();
+            wsConnection = null;
+            
+            // Attempt to reconnect with next URL
+            wsConnectionAttempts = MAX_RECONNECT_ATTEMPTS; // Force URL switch
+            setupWebSocketConnection();
+          }
+        }, 10000); // 10 second timeout
         
-        // Set up WebSocket event handlers
         wsConnection.onopen = () => {
           console.log('Notisky: WebSocket connection established');
           wsConnectionAttempts = 0;
+          
+          // Clear connection timeout
+          clearTimeout(connectionTimeout);
           
           // Subscribe to accounts for this user
           sendWebSocketMessage({
@@ -1262,6 +1312,9 @@ export default defineBackground((context) => {
           console.log(`Notisky: WebSocket connection closed, code: ${event.code}, reason: ${event.reason}`);
           wsConnection = null;
           
+          // Clear connection timeout if it exists
+          clearTimeout(connectionTimeout);
+          
           // Attempt to reconnect if this wasn't initiated by us
           if (wsConnectionAttempts < MAX_RECONNECT_ATTEMPTS) {
             wsConnectionAttempts++;
@@ -1272,7 +1325,15 @@ export default defineBackground((context) => {
               setupWebSocketConnection();
             }, delay) as unknown as number;
           } else {
-            console.log('Notisky: Max reconnect attempts reached, giving up');
+            console.log('Notisky: Max reconnect attempts reached for current URL, trying alternative URL');
+            // Reset connection attempts and try next URL
+            wsUrlIndex = (wsUrlIndex + 1) % ALTERNATE_WS_URLS.length;
+            wsConnectionAttempts = 0;
+            
+            // Try immediately with next URL
+            wsReconnectTimer = setTimeout(() => {
+              setupWebSocketConnection();
+            }, 1000) as unknown as number;
           }
         };
       } catch (error) {
@@ -1324,6 +1385,17 @@ export default defineBackground((context) => {
     }
   }
 
+  // Function to check WebSocket health and reconnect if needed
+  function checkWebSocketHealth() {
+    // If connection doesn't exist or isn't open/connecting, attempt to reconnect
+    if (!wsConnection || (wsConnection.readyState !== WebSocket.OPEN && wsConnection.readyState !== WebSocket.CONNECTING)) {
+      console.log('Notisky: WebSocket health check - connection is not healthy, reconnecting');
+      setupWebSocketConnection();
+      return false;
+    }
+    return true;
+  }
+
   // Main initialization
   function initialize() {
     console.log('Notisky: Initializing background script');
@@ -1345,6 +1417,9 @@ export default defineBackground((context) => {
     // Always try to connect to the auth server
     setupWebSocketConnection();
     
+    // Set up a health check timer for WebSocket connection
+    setInterval(checkWebSocketHealth, 60000); // Check every minute
+    
     // Set up an alarm to periodically try reconnecting if needed
     if (isRealBrowser && browser.alarms) {
       try {
@@ -1354,11 +1429,7 @@ export default defineBackground((context) => {
         
         browser.alarms.onAlarm.addListener((alarm) => {
           if (alarm.name === 'notiskyServerConnect') {
-            // If we don't have an active connection, try to reconnect
-            if (!wsConnection) {
-              console.log('Notisky: No active WebSocket connection, attempting to reconnect');
-              setupWebSocketConnection();
-            }
+            checkWebSocketHealth();
           }
         });
       } catch (error) {
