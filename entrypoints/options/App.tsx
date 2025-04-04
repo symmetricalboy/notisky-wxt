@@ -86,11 +86,36 @@ const App: React.FC = () => {
       // Use the fixed Vercel deployment URL
       const url = 'https://notisky.symm.app';
       
-      // Attempt to fetch server status
+      // First try the status.json file which is more reliable
+      try {
+        const jsonResponse = await fetch(`${url}/api/status.json`, {
+          method: 'GET',
+          headers: {
+            'Accept': 'application/json'
+          },
+          mode: 'cors'
+        });
+        
+        if (jsonResponse.ok) {
+          const contentType = jsonResponse.headers.get('content-type');
+          if (contentType && contentType.includes('application/json')) {
+            const data = await jsonResponse.json();
+            if (data.success) {
+              setServerStatus('connected');
+              setPreferences(prev => ({ ...prev, notificationServerUrl: url }));
+              return;
+            }
+          }
+        }
+      } catch (jsonError) {
+        console.warn('Could not fetch from status.json, trying API endpoint:', jsonError);
+      }
+
+      // Fallback to the API endpoint
       const response = await fetch(`${url}/api/status`, {
         method: 'GET',
         headers: {
-          'Content-Type': 'application/json'
+          'Accept': 'application/json'
         },
         mode: 'cors'
       }).catch(error => {
@@ -99,17 +124,20 @@ const App: React.FC = () => {
       });
       
       if (response.ok) {
-        const data = await response.json();
-        if (data.success) {
-          setServerStatus('connected');
-          // Save the URL in preferences
-          setPreferences(prev => ({
-            ...prev,
-            notificationServerUrl: url
-          }));
-          return;
+        // Verify content type is JSON before trying to parse
+        const contentType = response.headers.get('content-type');
+        if (contentType && contentType.includes('application/json')) {
+          const data = await response.json();
+          if (data.success) {
+            setServerStatus('connected');
+            setPreferences(prev => ({ ...prev, notificationServerUrl: url }));
+            return;
+          } else {
+            console.error('Server returned non-success status:', data);
+            setServerStatus('error');
+          }
         } else {
-          console.error('Server returned non-success status:', data);
+          console.error('Server returned non-JSON content type:', contentType);
           setServerStatus('error');
         }
       } else {

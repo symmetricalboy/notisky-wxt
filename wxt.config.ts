@@ -41,7 +41,7 @@ export default defineConfig({
       matches: ['*://notisky.symm.app/*']
     }
   },
-  runner: {
+  webExt: {
     startUrls: ['https://bsky.app/']
   },
   entrypoints: {
