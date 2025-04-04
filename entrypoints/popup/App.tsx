@@ -1,8 +1,30 @@
 import React, { useState, useEffect } from 'react';
 import { browser } from 'wxt/browser';
-import type { AccountSession } from '../utils/storage'; // Import shared interface
+import type { AccountSession } from '../../utils/storage'; // Corrected import path assumed based on wxt structure
 import './App.css';
 import './style.css';
+
+// Helper function for retrying promises - Temporarily remove retry logic
+/*
+const retry = <T,>(fn: () => Promise<T>, retries = 3, delay = 300): Promise<T> => {
+  return new Promise((resolve, reject) => {
+    const attempt = (n: number) => {
+      fn()
+        .then(resolve)
+        .catch((err) => {
+          console.log('Retry attempt failed with error:', err);
+          if (n <= 1) {
+            reject(err);
+          } else {
+            console.log(`Retrying (${retries - n + 1}/${retries})...`);
+            setTimeout(() => attempt(n - 1), delay);
+          }
+        });
+    };
+    attempt(retries);
+  });
+};
+*/
 
 function App() {
   // Store accounts as a Record<did, AccountSession>
@@ -10,31 +32,65 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [authenticating, setAuthenticating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'error'>('connecting'); // Add connection status
 
-  // Fetch accounts from background script
-  const fetchAccounts = async () => {
+  // Fetch accounts from background script with retry
+  const fetchAccounts = React.useCallback(async () => { // Use useCallback
     setLoading(true);
     setError(null);
+    setConnectionStatus('connecting'); // Start as connecting
+
     try {
-      const response = await browser.runtime.sendMessage({ action: 'getAccounts' });
-      if (response.success) {
-        setAccounts(response.accounts || {});
-      } else {
-        console.error('Failed to fetch accounts:', response.error);
-        setError('Failed to load account data.');
-        setAccounts({}); // Clear accounts on error
-      }
-    } catch (err: any) {
-      console.error('Error messaging background script:', err);
-      setError('Could not connect to extension background. Try reloading the extension.');
-      setAccounts({}); 
+       // Temporarily remove retry - direct call with logging
+       console.log('[Popup] Attempting direct fetch accounts...');
+       let response: any;
+       try {
+           response = await browser.runtime.sendMessage({ action: 'getAccounts' });
+           console.log('[Popup] Received response from sendMessage:', response);
+       } catch (sendMessageError) {
+           console.error('[Popup] Error calling sendMessage:', sendMessageError);
+           setError('Error communicating with background script.');
+           setConnectionStatus('error');
+           setLoading(false);
+           return; // Stop if sendMessage itself fails
+       }
+
+       if (response && response.success) {
+         console.log('[Popup] Fetch successful, accounts:', response.accounts);
+         setAccounts(response.accounts || {});
+         setConnectionStatus('connected');
+       } else {
+         // Handle unsuccessful response or undefined
+         const errorMsg = response?.error || 'Unknown error from background';
+         console.error('[Popup] Fetch failed:', errorMsg, '(Response:', response, ')');
+         setError(`Failed to load accounts: ${errorMsg}`);
+         setAccounts({});
+         setConnectionStatus('error');
+       }
+    } catch (err: any) { // Catch unexpected errors during processing
+       console.error('[Popup] Unexpected error in fetchAccounts:', err);
+       setError('An unexpected error occurred.');
+       setAccounts({});
+       setConnectionStatus('error');
     } finally {
       setLoading(false);
     }
-  };
+  }, []); // Empty dependency array for useCallback
 
   // Initial load & Badge Reset
   useEffect(() => {
+    // Test basic ping/pong communication
+    const testPing = async () => {
+      try {
+        console.log('[Popup] Sending ping...');
+        const pongResponse = await browser.runtime.sendMessage({ action: 'ping' });
+        console.log('[Popup] Received pong response:', pongResponse);
+      } catch (err) {
+        console.error('[Popup] Error during ping test:', err);
+      }
+    };
+    testPing();
+
     fetchAccounts();
 
     // Clear the badge count when popup opens
@@ -43,12 +99,25 @@ function App() {
 
     // Listener for updates from background script
     const messageListener = (message: any) => {
-      if (message.action === 'authStateChanged') {
-        console.log('Popup received authStateChanged:', message.accounts);
-        setAccounts(message.accounts || {});
-        setError(null); // Clear error on update
-        setAuthenticating(false); // Ensure authenticating state is reset
+      // Listen for specific account changes
+      if (message.action === 'accountAdded') {
+        console.log('Popup received accountAdded:', message.account);
+        setAccounts(prevAccounts => ({
+          ...prevAccounts,
+          [message.account.did]: message.account
+        }));
+        setError(null);
+        setAuthenticating(false); 
+      } else if (message.action === 'accountRemoved') {
+         console.log('Popup received accountRemoved:', message.did);
+         setAccounts(prevAccounts => {
+           const newAccounts = { ...prevAccounts };
+           delete newAccounts[message.did];
+           return newAccounts;
+         });
+         setError(null);
       }
+      // Add handlers for other messages like 'reAuthRequired' or 'notificationUpdate' if needed
     };
 
     browser.runtime.onMessage.addListener(messageListener);
@@ -113,10 +182,10 @@ function App() {
       </div>
 
       {loading ? (
-        <div className="status-message">Loading accounts...</div>
+        <div className="status-message">Connecting...</div> // Changed initial loading message
       ) : authenticating ? (
         <div className="status-message">Redirecting to Bluesky for login...</div>
-      ) : error ? (
+      ) : connectionStatus === 'error' ? ( // Check connectionStatus for error display
         <div className="error-message">Error: {error}</div>
       ) : (
         <>

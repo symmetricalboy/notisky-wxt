@@ -1,9 +1,17 @@
 import { browser } from 'wxt/browser';
 
-// Placeholder for Bluesky OAuth configuration - replace with actual values
-const BLUESKY_CLIENT_ID = 'https://notisky.symm.app/client-metadata.json'; // Use the URL of the hosted metadata file
-const BLUESKY_AUTHORIZATION_ENDPOINT = 'https://bsky.app/oauth/authorize'; // TODO: Verify endpoint
-const BLUESKY_TOKEN_ENDPOINT = 'https://api.bsky.app/oauth/token'; // TODO: Verify endpoint
+// Define interfaces for key pair structure (if not already global)
+interface DPoPKeyPair {
+  publicKey: JsonWebKey;
+  privateKey: CryptoKey;
+}
+
+// Endpoints and Keys (Verify these)
+// Use the URL of the hosted metadata file as the client_id
+const METADATA_CLIENT_ID_URL = 'https://notisky.symm.app/client-metadata.json'; 
+// const BLUESKY_CLIENT_ID = 'YOUR_BLUESKY_CLIENT_ID_HERE'; // <-- REMOVE STATIC PLACEHOLDER
+const BLUESKY_AUTHORIZATION_ENDPOINT = 'https://bsky.app/oauth/authorize';
+const BLUESKY_TOKEN_ENDPOINT = 'https://bsky.app/xrpc/com.atproto.server.oauthGetAccessToken'; // Use correct XRPC endpoint
 const DPOP_KEY_STORAGE_KEY = 'notisky_dpop_keypair';
 const TOKEN_ENDPOINT_NONCE_KEY = 'notisky_token_endpoint_nonce';
 
@@ -189,96 +197,87 @@ async function storeTokenEndpointNonce(nonce: string): Promise<void> {
 // --- Authentication Flow Functions --- 
 
 /**
- * Initiates the Bluesky OAuth flow using browser.identity.launchWebAuthFlow
- * 
- * @param handleAuthCallback A function from the background script to handle the redirect result.
+ * Initiates the Bluesky OAuth flow.
+ * Stores necessary details (state, verifier, clientId, redirectUri) for the callback handler.
+ * @returns A Promise resolving with the redirect URL string on success, 
+ *          or rejecting with an error on failure or cancellation.
  */
-export async function initiateBlueskyAuth(
-  handleAuthCallback: (redirectUrl?: string) => Promise<void>
-): Promise<{ success: boolean; error?: string }> { // Return type indicates initiation success/failure
+export async function initiateBlueskyAuth(): Promise<string> {
   if (!browser.identity) {
     console.error('browser.identity API not available.');
-    return { success: false, error: 'Browser identity API not available.' };
+    throw new Error('Browser identity API not available.');
   }
 
-  let resultUrl: string | undefined;
   try {
     const state = generateRandomString(32);
     const codeVerifier = generateRandomString(128);
     const codeChallenge = await generateCodeChallenge(codeVerifier);
     const redirectUri = browser.identity.getRedirectURL(); 
+    const clientId = METADATA_CLIENT_ID_URL; // <-- USE THE METADATA URL
 
+    // Store necessary info for the token exchange step
     await browser.storage.local.set({
       auth_state_expected: state,
       auth_code_verifier: codeVerifier,
+      auth_client_id: clientId,      // Store actual clientId used (the URL)
+      auth_redirect_uri: redirectUri   // Store redirectUri for validation
     });
 
     const authUrl = new URL(BLUESKY_AUTHORIZATION_ENDPOINT);
     authUrl.searchParams.append('response_type', 'code');
-    authUrl.searchParams.append('client_id', BLUESKY_CLIENT_ID);
+    authUrl.searchParams.append('client_id', clientId); // <-- Use metadata URL
     authUrl.searchParams.append('redirect_uri', redirectUri);
-    authUrl.searchParams.append('scope', 'read write'); // Adjust scopes as needed
+    authUrl.searchParams.append('scope', 'com.atproto.repo.read com.atproto.repo.write com.atproto.notification.read'); // Example scopes, adjust as needed
     authUrl.searchParams.append('state', state);
     authUrl.searchParams.append('code_challenge', codeChallenge);
     authUrl.searchParams.append('code_challenge_method', 'S256');
 
     console.log('Initiating auth flow with URL:', authUrl.toString());
 
-    resultUrl = await browser.identity.launchWebAuthFlow({
+    const resultUrl = await browser.identity.launchWebAuthFlow({
       interactive: true,
       url: authUrl.toString(),
     });
 
-    // --- Callback Handling --- 
-    // Call the background script's handler function immediately after the flow completes.
-    await handleAuthCallback(resultUrl);
-    // --- End Callback Handling ---
-
-    // The success/failure of the *overall* auth is determined within handleAuthCallback.
-    // This function now only reports if the flow window was launched and returned.
     if (!resultUrl) {
-      // This case is technically handled by handleAuthCallback(undefined) now,
-      // but we keep the log for clarity.
-      console.log('Auth flow cancelled by user or failed (no result URL).');
-      return { success: false, error: 'Authentication flow cancelled or failed.' };
+        console.log('Auth flow cancelled by user or failed (no result URL).');
+        throw new Error('Authentication flow cancelled or failed.');
     }
 
-    console.log('Auth flow window completed.');
-    return { success: true }; // Indicate flow *initiation* success
+    console.log('Auth flow window completed, returning result URL.');
+    return resultUrl;
 
-  } catch (error) {
-    console.error('Error during Bluesky authentication flow:', error);
-    // Ensure callback is called even on error, potentially with undefined
-    await handleAuthCallback(undefined); 
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : 'Unknown error during authentication',
-    };
+  } catch (error: any) {
+    console.error('Error during Bluesky authentication flow initiation:', error);
+    // Clean up stored values if initiation fails?
+    await browser.storage.local.remove(['auth_state_expected', 'auth_code_verifier', 'auth_client_id', 'auth_redirect_uri']);
+    throw new Error(error.message || 'Error launching auth flow.');
   }
 }
 
 /**
- * Exchanges the authorization code for access and refresh tokens.
+ * Exchanges the authorization code for access and refresh tokens using the correct XRPC endpoint.
  * Includes DPoP proof generation and nonce handling.
  */
 export async function exchangeCodeForToken(
   code: string,
-  redirectUri: string,
+  clientId: string,      // Passed from background script - should be the metadata URL now
   codeVerifier: string,
-  retryAttempt = 0 // Add retry count
-): Promise<{ success: boolean; accessToken?: string; refreshToken?: string; error?: string }> {
-  const MAX_DPOP_RETRIES = 1; // Only retry once on nonce error
+  redirectUri: string,    // Added redirectUri
+  retryAttempt = 0
+): Promise<{ success: boolean; did?: string; handle?: string; accessJwt?: string; refreshJwt?: string; error?: string }> { // Updated return type for success
+  const MAX_DPOP_RETRIES = 1;
 
   const dpopKeyPair = await getDPoPKeyPair();
   if (!dpopKeyPair) {
     return { success: false, error: 'Failed to get DPoP key pair.' };
   }
   
-  // Get the last known nonce for the token endpoint
   const currentNonce = await getTokenEndpointNonce();
   
+  // DPoP proof for the XRPC endpoint
   const dpopProof = await generateDPoPProof(
-    BLUESKY_TOKEN_ENDPOINT, 
+    BLUESKY_TOKEN_ENDPOINT, // Target the XRPC token endpoint URL
     'POST',
     dpopKeyPair,
     currentNonce
@@ -289,62 +288,68 @@ export async function exchangeCodeForToken(
   }
 
   try {
-    console.log(`Attempting token exchange (Attempt ${retryAttempt + 1})`);
+    console.log(`Attempting token exchange via XRPC (Attempt ${retryAttempt + 1})`);
     const response = await fetch(BLUESKY_TOKEN_ENDPOINT, {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Type': 'application/json', // XRPC uses JSON
         'DPoP': dpopProof,
       },
-      body: new URLSearchParams({
-        grant_type: 'authorization_code',
+      body: JSON.stringify({
+        grant_type: 'authorization_code', // Check if XRPC uses this Grant Type name
         code: code,
         redirect_uri: redirectUri,
-        client_id: BLUESKY_CLIENT_ID,
+        client_id: clientId,
         code_verifier: codeVerifier,
       }),
     });
 
     const newNonce = response.headers.get('DPoP-Nonce');
     if (newNonce && newNonce !== currentNonce) {
-      console.log('Received new DPoP nonce for token endpoint, storing:', newNonce);
+      console.log('Received new DPoP nonce, storing:', newNonce);
       await storeTokenEndpointNonce(newNonce);
     }
 
     // Handle DPoP nonce error (HTTP 401 use_dpop_nonce)
     if (response.status === 401 && retryAttempt < MAX_DPOP_RETRIES) {
-       // Check if it's specifically a nonce error (might need to parse body or WWW-Authenticate)
-       // Assuming any 401 here might be a nonce issue for simplicity for now.
-       console.warn(`Token endpoint returned 401. Assuming DPoP nonce issue, retrying with new nonce (${newNonce || 'none'}).`);
+       console.warn(`Token endpoint returned 401. Assuming DPoP nonce issue, retrying...`);
        if (newNonce) {
-         // Retry the request with the new nonce
-         return await exchangeCodeForToken(code, redirectUri, codeVerifier, retryAttempt + 1);
+         return await exchangeCodeForToken(code, clientId, codeVerifier, redirectUri, retryAttempt + 1);
        } else {
-         console.error('Token endpoint returned 401 but no new DPoP-Nonce header found.');
-         return { success: false, error: 'Authorization failed (status 401) and no new DPoP nonce provided for retry.' };
+         console.error('Token endpoint returned 401 but no new DPoP-Nonce header.');
+         return { success: false, error: 'Authorization failed (status 401) and no new DPoP nonce.' };
        }
     } else if (response.status === 401) {
-      // Max retries reached or other 401 error
-       console.error(`Token endpoint returned 401 after ${retryAttempt + 1} attempts or for other reason.`);
+       console.error(`Token endpoint returned 401 after ${retryAttempt + 1} attempts.`);
        return { success: false, error: 'Authorization failed (status 401).' };
     }
 
-    // --- Success or other non-401 error ---
     const responseData = await response.json();
 
     if (!response.ok) {
       console.error(`Token exchange failed with status ${response.status}:`, responseData);
-      return { success: false, error: responseData.error_description || responseData.error || `Failed to exchange token (status ${response.status})` };
+      const errorMsg = responseData.message || responseData.error || `Failed to exchange token (status ${response.status})`;
+      // Handle specific XRPC errors if possible
+      if (errorMsg.includes('invalid_grant')) {
+          return { success: false, error: 'Invalid authorization code or verifier.' };
+      }
+      return { success: false, error: errorMsg };
     }
 
-    console.log('Token exchange successful:', responseData);
-    // Clear the nonce on successful exchange? Or keep it for potential future use?
-    // Let's keep it for now.
-    return {
-      success: true,
-      accessToken: responseData.access_token,
-      refreshToken: responseData.refresh_token,
-    };
+    // Assuming successful XRPC response contains session details
+    if (responseData.did && responseData.handle && responseData.accessJwt && responseData.refreshJwt) {
+        console.log('Token exchange successful (XRPC):', responseData);
+        return {
+          success: true,
+          did: responseData.did,
+          handle: responseData.handle,
+          accessJwt: responseData.accessJwt,
+          refreshJwt: responseData.refreshJwt,
+        };
+    } else {
+        console.error('Token exchange response missing expected fields:', responseData);
+        return { success: false, error: 'Token exchange response missing expected fields.' };
+    }
     
   } catch (error) {
     console.error('Network or unexpected error during token exchange:', error);
@@ -356,10 +361,8 @@ export async function exchangeCodeForToken(
 }
 
 // TODO:
-// - Implement secure token storage (mapping tokens to accounts/dids)
-// - Implement token refresh logic using the refresh token
-// - Replace placeholder client_id and verify endpoints
-// - Integrate this into the background script's callback handling for launchWebAuthFlow 
+// - Implement token refresh logic using the refresh token and the specific refresh XRPC endpoint
+// - Double-check required Bluesky scopes
 
 // --- TODOs ---
 // - Verify if BskyAgent handles DPoP nonces automatically for PDS requests.
