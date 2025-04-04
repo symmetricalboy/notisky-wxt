@@ -46,10 +46,10 @@ export default defineBackground((context) => {
   const MAX_RECONNECT_ATTEMPTS = 5;
   const RECONNECT_DELAY = 5000; // 5 seconds
   const AUTH_SERVER_URL = 'https://notisky.symm.app';
-  const AUTH_SERVER_WS_URL = 'wss://notisky-auth.vercel.app'; // Primary fallback WebSocket URL
+  const AUTH_SERVER_WS_URL = 'wss://notisky-auth.vercel.app/ws'; // Updated with /ws path
   const ALTERNATE_WS_URLS = [
-    'wss://notisky-auth.vercel.app',   // Primary WebSocket URL
-    'wss://notisky-auth-server.vercel.app'  // Alternative WebSocket URL
+    'wss://notisky-auth.vercel.app/ws',   // Updated primary URL with /ws path
+    'wss://notisky-auth-server.vercel.app/ws'  // Updated alternative URL with /ws path
   ];
   let wsUrlIndex = 0; // Track which WebSocket URL we're trying
 
@@ -1226,8 +1226,15 @@ export default defineBackground((context) => {
                 
                 // Use the WebSocket URL from the status response if available
                 if (statusData.serverUrl) {
-                  wsUrl = statusData.serverUrl;
+                  // Make sure the URL includes the /ws path
+                  wsUrl = statusData.serverUrl.endsWith('/ws') 
+                    ? statusData.serverUrl 
+                    : `${statusData.serverUrl}/ws`;
                   console.log('Notisky: Using WebSocket URL from status API:', wsUrl);
+                } else if (statusData.wsEndpoint) {
+                  // Try to use wsEndpoint if available (from ws-info endpoint)
+                  wsUrl = statusData.wsEndpoint;
+                  console.log('Notisky: Using WebSocket endpoint from status API:', wsUrl);
                 } else {
                   console.log('Notisky: Status API did not provide serverUrl, using fallback URL:', ALTERNATE_WS_URLS[wsUrlIndex]);
                   wsUrl = ALTERNATE_WS_URLS[wsUrlIndex];
@@ -1239,6 +1246,28 @@ export default defineBackground((context) => {
               wsUrl = ALTERNATE_WS_URLS[wsUrlIndex];
             }
           }
+        }
+
+        // Also check the WebSocket info endpoint for the correct URL
+        try {
+          console.log(`Notisky: Checking WebSocket info at ${AUTH_SERVER_URL}/api/ws-info`);
+          const wsInfoResponse = await fetch(`${AUTH_SERVER_URL}/api/ws-info`, {
+            method: 'GET',
+            headers: {
+              'Content-Type': 'application/json'
+            },
+            mode: 'cors'
+          });
+
+          if (wsInfoResponse.ok) {
+            const wsInfoData = await wsInfoResponse.json();
+            if (wsInfoData.wsEndpoint) {
+              wsUrl = wsInfoData.wsEndpoint;
+              console.log('Notisky: Using WebSocket URL from ws-info endpoint:', wsUrl);
+            }
+          }
+        } catch (wsInfoError) {
+          console.error('Notisky: Error checking WebSocket info, continuing with current URL', wsInfoError);
         }
       } catch (statusError) {
         console.error('Notisky: Error checking server status', statusError);
