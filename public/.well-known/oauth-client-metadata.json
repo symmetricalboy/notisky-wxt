@@ -1,0 +1,7 @@
+{
+  "client_name": "Notisky",
+  "client_uri": "https://notisky.symm.app",
+  "logo_uri": "https://notisky.symm.app/icon.svg",
+  "redirect_uris": ["https://notisky.symm.app/auth/callback"],
+  "scope": "com.atproto.feed:read com.atproto.feed:write com.atproto.notification:read"
+} 

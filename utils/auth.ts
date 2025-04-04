@@ -5,14 +5,16 @@
 
 // Auth configuration
 const AUTH_CONFIG = {
-  // The URL to the authorization endpoint
+  // Use Bluesky's intent/oauth endpoint directly
   authUrl: 'https://bsky.app/intent/oauth',
   // Base URL for the auth server
   serverBaseUrl: 'https://notisky.symm.app',
   // The redirect URL that will receive the authorization code
   redirectUrl: 'https://notisky.symm.app/auth/callback',
   // Client ID for the application
-  clientId: 'https://notisky.symm.app/.well-known/oauth-client-metadata.json'
+  clientId: 'notisky-extension',
+  // Well-known client metadata URL (required for Bluesky OAuth)
+  clientMetadataUrl: 'https://notisky.symm.app/.well-known/oauth-client-metadata.json'
 };
 
 /**
@@ -65,9 +67,6 @@ export async function authenticateUser(): Promise<AuthResponse> {
  */
 function setupAuthListener(expectedState: string): Promise<AuthResponse> {
   return new Promise((resolve) => {
-    // Store the resolver function so we can call it when auth completes
-    storeResolver(resolve);
-    
     // Set up storage listener to handle auth completion
     const storageListener = async (changes: any) => {
       if (changes.auth_code && changes.auth_state) {
@@ -109,12 +108,57 @@ function setupAuthListener(expectedState: string): Promise<AuthResponse> {
       }
     };
     
+    // Also listen for direct messages from content script
+    const messageListener = async (message: any, sender: any) => {
+      if (message.action === 'authSuccess' && message.code && message.state) {
+        console.log('Received auth success message from content script');
+        
+        // Verify state matches
+        if (message.state !== expectedState) {
+          console.error('State mismatch in auth flow (message)');
+          // Don't resolve here as storage listener will handle it
+          return;
+        }
+        
+        try {
+          // Get stored code verifier
+          const { auth_code_verifier } = await browser.storage.local.get('auth_code_verifier');
+          
+          // Exchange code for token
+          const tokenResponse = await exchangeCodeForToken(message.code, auth_code_verifier);
+          
+          // Clean up storage
+          await browser.storage.local.remove(['auth_code', 'auth_state', 'auth_code_verifier']);
+          
+          // Resolve with success
+          resolve({
+            success: true,
+            token: tokenResponse.access_token
+          });
+          
+          // Clean up listeners
+          browser.storage.onChanged.removeListener(storageListener);
+          browser.runtime.onMessage.removeListener(messageListener);
+          
+          return true;
+        } catch (error: any) {
+          console.error('Error exchanging code for token (message):', error);
+          // Don't resolve here as storage listener will handle it
+          return;
+        }
+      }
+    };
+    
     // Listen for storage changes
     browser.storage.onChanged.addListener(storageListener);
+    
+    // Listen for messages
+    browser.runtime.onMessage.addListener(messageListener);
     
     // Set a timeout to clean up and reject after 5 minutes
     setTimeout(() => {
       browser.storage.onChanged.removeListener(storageListener);
+      browser.runtime.onMessage.removeListener(messageListener);
       resolve({
         success: false,
         error: 'Authentication timed out. Please try again.'
@@ -124,22 +168,13 @@ function setupAuthListener(expectedState: string): Promise<AuthResponse> {
 }
 
 /**
- * Store the resolver function in storage for later use by the callback page
- */
-async function storeResolver(resolve: (value: AuthResponse) => void) {
-  // Store the resolver in a global variable that can be accessed by the content script
-  // @ts-ignore
-  window.notiskyAuthResolver = resolve;
-}
-
-/**
  * Build the authorization URL for Bluesky OAuth
  */
 function buildAuthUrl(state: string, codeChallenge: string): string {
   const url = new URL(AUTH_CONFIG.authUrl);
   
-  // Add required OAuth 2.0 parameters
-  url.searchParams.append('client_id', AUTH_CONFIG.clientId);
+  // Add required OAuth 2.0 parameters for Bluesky
+  url.searchParams.append('client_id', AUTH_CONFIG.clientMetadataUrl);
   url.searchParams.append('redirect_uri', AUTH_CONFIG.redirectUrl);
   url.searchParams.append('response_type', 'code');
   url.searchParams.append('state', state);
@@ -149,6 +184,7 @@ function buildAuthUrl(state: string, codeChallenge: string): string {
   // Add Bluesky-specific scopes
   url.searchParams.append('scope', 'com.atproto.feed:read com.atproto.feed:write com.atproto.notification:read');
   
+  // Log the full URL for debugging
   console.log('Built auth URL:', url.toString());
   return url.toString();
 }
@@ -204,7 +240,7 @@ async function exchangeCodeForToken(code: string, codeVerifier: string): Promise
       code,
       code_verifier: codeVerifier,
       redirect_uri: AUTH_CONFIG.redirectUrl,
-      client_id: 'notisky-extension',
+      client_id: AUTH_CONFIG.clientId,
       grant_type: 'authorization_code'
     })
   });
