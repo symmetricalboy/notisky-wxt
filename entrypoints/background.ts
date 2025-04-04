@@ -1199,15 +1199,45 @@ export default defineBackground((context) => {
       // Check server status first to get the proper WebSocket URL
       try {
         console.log(`Notisky: Checking server status at ${AUTH_SERVER_URL}/api/status`);
-        const statusResponse = await fetch(`${AUTH_SERVER_URL}/api/status`, {
-          method: 'GET',
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          mode: 'cors'
-        });
+        
+        // Function to safely check endpoint with CORS handling
+        const safelyCheckEndpoint = async (url: string) => {
+          try {
+            const response = await fetch(url, {
+              method: 'GET',
+              headers: {
+                'Content-Type': 'application/json'
+              },
+              mode: 'cors'
+            });
+            return response;
+          } catch (corsError) {
+            console.error(`Notisky: CORS error accessing ${url}:`, corsError);
+            
+            // Try with no-cors mode just to check reachability
+            try {
+              await fetch(url, {
+                method: 'GET',
+                mode: 'no-cors'
+              });
+              
+              // If we get here, endpoint is reachable but has CORS restrictions
+              console.log(`Notisky: Endpoint ${url} is reachable but has CORS restrictions`);
+              return null;
+            } catch (noCorsError) {
+              console.error(`Notisky: Endpoint ${url} is not reachable:`, noCorsError);
+              return null;
+            }
+          }
+        };
 
-        if (!statusResponse.ok) {
+        // Check main status endpoint
+        const statusResponse = await safelyCheckEndpoint(`${AUTH_SERVER_URL}/api/status`);
+        
+        if (!statusResponse) {
+          console.log('Notisky: Using fallback WebSocket URL due to CORS or connectivity issues:', ALTERNATE_WS_URLS[wsUrlIndex]);
+          wsUrl = ALTERNATE_WS_URLS[wsUrlIndex];
+        } else if (!statusResponse.ok) {
           console.error(`Notisky: Server returned error status: ${statusResponse.status}`);
           console.log('Notisky: Using fallback WebSocket URL:', ALTERNATE_WS_URLS[wsUrlIndex]);
           wsUrl = ALTERNATE_WS_URLS[wsUrlIndex];
@@ -1265,58 +1295,38 @@ export default defineBackground((context) => {
         }
 
         // Also check the WebSocket info endpoint for the correct URL
-        try {
-          console.log(`Notisky: Checking WebSocket info at ${AUTH_SERVER_URL}/api/ws-info`);
-          const wsInfoResponse = await fetch(`${AUTH_SERVER_URL}/api/ws-info`, {
-            method: 'GET',
-            headers: {
-              'Content-Type': 'application/json'
-            },
-            mode: 'cors'
-          });
+        console.log(`Notisky: Checking WebSocket info at ${AUTH_SERVER_URL}/api/ws-info`);
+        const wsInfoResponse = await safelyCheckEndpoint(`${AUTH_SERVER_URL}/api/ws-info`);
 
-          if (wsInfoResponse.ok) {
-            const wsInfoData = await wsInfoResponse.json();
-            if (wsInfoData.wsEndpoint) {
-              wsUrl = wsInfoData.wsEndpoint;
+        if (wsInfoResponse && wsInfoResponse.ok) {
+          const wsInfoData = await wsInfoResponse.json();
+          if (wsInfoData.wsEndpoint) {
+            wsUrl = wsInfoData.wsEndpoint;
+            
+            // Make sure the URL has a WebSocket protocol
+            if (!wsUrl.startsWith('ws://') && !wsUrl.startsWith('wss://')) {
+              wsUrl = wsUrl.replace('https://', 'wss://').replace('http://', 'ws://');
+            }
+            
+            console.log('Notisky: Using WebSocket URL from ws-info endpoint:', wsUrl);
+          }
+        } else {
+          // Try an alternative ws-info endpoint path
+          console.log(`Notisky: Trying alternative WebSocket info endpoint at ${AUTH_SERVER_URL}/ws-info`);
+          const altResponse = await safelyCheckEndpoint(`${AUTH_SERVER_URL}/ws-info`);
+          
+          if (altResponse && altResponse.ok) {
+            const altData = await altResponse.json();
+            if (altData.wsEndpoint) {
+              wsUrl = altData.wsEndpoint;
               
               // Make sure the URL has a WebSocket protocol
               if (!wsUrl.startsWith('ws://') && !wsUrl.startsWith('wss://')) {
                 wsUrl = wsUrl.replace('https://', 'wss://').replace('http://', 'ws://');
               }
               
-              console.log('Notisky: Using WebSocket URL from ws-info endpoint:', wsUrl);
+              console.log('Notisky: Using WebSocket URL from alternative ws-info endpoint:', wsUrl);
             }
-          }
-        } catch (wsInfoError) {
-          console.error('Notisky: Error checking WebSocket info, continuing with current URL', wsInfoError);
-          
-          // Try an alternative ws-info endpoint path
-          try {
-            console.log(`Notisky: Trying alternative WebSocket info endpoint at ${AUTH_SERVER_URL}/ws-info`);
-            const altResponse = await fetch(`${AUTH_SERVER_URL}/ws-info`, {
-              method: 'GET',
-              headers: {
-                'Content-Type': 'application/json'
-              },
-              mode: 'cors'
-            });
-            
-            if (altResponse.ok) {
-              const altData = await altResponse.json();
-              if (altData.wsEndpoint) {
-                wsUrl = altData.wsEndpoint;
-                
-                // Make sure the URL has a WebSocket protocol
-                if (!wsUrl.startsWith('ws://') && !wsUrl.startsWith('wss://')) {
-                  wsUrl = wsUrl.replace('https://', 'wss://').replace('http://', 'ws://');
-                }
-                
-                console.log('Notisky: Using WebSocket URL from alternative ws-info endpoint:', wsUrl);
-              }
-            }
-          } catch (altError) {
-            console.error('Notisky: Error checking alternative WebSocket info endpoint', altError);
           }
         }
       } catch (statusError) {
@@ -1337,14 +1347,27 @@ export default defineBackground((context) => {
           // Validate the URL before attempting to connect
           new URL(wsUrl); // Will throw if invalid URL
           
-          wsConnection = new WebSocket(wsUrl);
+          // If we're having CORS issues, add a random query parameter to bypass potential caching
+          // that might be causing the CORS issue (cached preflight responses)
+          const randomQueryParam = `_=${Date.now()}`;
+          const hasQueryParams = wsUrl.includes('?');
+          const corsWorkaroundUrl = hasQueryParams ? `${wsUrl}&${randomQueryParam}` : `${wsUrl}?${randomQueryParam}`;
+          
+          console.log(`Notisky: Using URL with CORS workaround: ${corsWorkaroundUrl}`);
+          wsConnection = new WebSocket(corsWorkaroundUrl);
         } catch (urlError) {
           console.error(`Notisky: Invalid WebSocket URL: ${wsUrl}`, urlError);
           // Try a different URL immediately
           wsUrlIndex = (wsUrlIndex + 1) % ALTERNATE_WS_URLS.length;
           wsUrl = ALTERNATE_WS_URLS[wsUrlIndex];
           console.log(`Notisky: Trying alternative WebSocket URL: ${wsUrl}`);
-          wsConnection = new WebSocket(wsUrl);
+          
+          // Add a random query parameter to bypass potential caching
+          const randomQueryParam = `_=${Date.now()}`;
+          const hasQueryParams = wsUrl.includes('?');
+          const corsWorkaroundUrl = hasQueryParams ? `${wsUrl}&${randomQueryParam}` : `${wsUrl}?${randomQueryParam}`;
+          
+          wsConnection = new WebSocket(corsWorkaroundUrl);
         }
         
         // Get the userId from storage
@@ -1435,14 +1458,9 @@ export default defineBackground((context) => {
             console.error('Notisky: WebSocket connection state:', wsConnection ? wsConnection.readyState : 'No connection');
             console.error('Notisky: WebSocket URL:', wsUrl);
             
-            // Check if the WebSocket endpoint is reachable
-            fetch(wsUrl.replace('wss://', 'https://').replace('ws://', 'http://'))
-              .then(response => {
-                console.log(`Notisky: WebSocket endpoint reachability test: ${response.status}`);
-              })
-              .catch(fetchError => {
-                console.error('Notisky: WebSocket endpoint is not reachable:', fetchError.message);
-              });
+            // Don't attempt to fetch the WebSocket endpoint as it causes CORS errors
+            // Instead, just try the next URL in our list
+            console.log('Notisky: Skipping reachability test due to potential CORS issues');
           } catch (loggingError) {
             console.error('Notisky: Error while logging WebSocket error details:', loggingError.message);
           }
