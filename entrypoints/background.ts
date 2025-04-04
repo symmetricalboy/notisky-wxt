@@ -36,7 +36,6 @@ export default defineBackground((context) => {
     handle: string;
     accessJwt: string;
     refreshJwt: string;
-    userId: string;
   }
   
   // WebSocket connection for auth server
@@ -1742,4 +1741,335 @@ export default defineBackground((context) => {
       });
     }
   }
+
+  // Add these new functions to handle direct polling and OAuth
+
+  // Directly poll Bluesky for notifications
+  async function pollBlueskyNotifications(session: AccountSession) {
+    try {
+      const agent = new BskyAgent({ service: 'https://bsky.social' });
+      
+      // Resume the session with stored tokens
+      await agent.resumeSession({
+        did: session.did,
+        handle: session.handle,
+        accessJwt: session.accessJwt,
+        refreshJwt: session.refreshJwt
+      });
+      
+      // Get unread notification count
+      const notifications = await agent.listNotifications({
+        limit: 30
+      });
+      
+      // Handle notifications
+      const unreadCount = notifications.data.notifications.filter(
+        notification => !notification.isRead
+      ).length;
+      
+      // Get unread message count
+      let unreadMessageCount = 0;
+      try {
+        const feeds = await agent.app.bsky.feed.getTimeline({ limit: 1 });
+        if (feeds.success) {
+          const feedView = feeds.data;
+          if (feedView && feedView.view) {
+            // Check if feedView.view contains unreadCount property
+            const messages = await agent.countUnreadNotifications();
+            unreadMessageCount = messages.count;
+          }
+        }
+      } catch (messageError) {
+        console.error('Error checking unread messages:', messageError);
+      }
+      
+      // Build notification data
+      const notificationData: NotificationData = {
+        notification: unreadCount,
+        message: unreadMessageCount,
+        total: unreadCount + unreadMessageCount,
+        notifications: notifications.data.notifications,
+        messages: [], // We don't load all messages for efficiency
+        accountInfo: {
+          did: session.did,
+          handle: session.handle,
+        },
+        timestamp: Date.now()
+      };
+      
+      // Update badge and show notifications
+      updateNotificationBadge(session.did, notificationData);
+      
+      // Store the notifications data
+      try {
+        const { accountNotifications = [] } = await browser.storage.local.get('accountNotifications');
+        
+        // Find existing notifications for this account
+        const existingIndex = accountNotifications.findIndex(
+          (an: any) => an.did === session.did
+        );
+        
+        if (existingIndex >= 0) {
+          // Update existing notifications
+          accountNotifications[existingIndex] = {
+            did: session.did,
+            handle: session.handle,
+            notification: notificationData.notification,
+            message: notificationData.message,
+            total: notificationData.total,
+            timestamp: notificationData.timestamp
+          };
+        } else {
+          // Add new notifications
+          accountNotifications.push({
+            did: session.did,
+            handle: session.handle,
+            notification: notificationData.notification,
+            message: notificationData.message,
+            total: notificationData.total,
+            timestamp: notificationData.timestamp
+          });
+        }
+        
+        // Save to storage
+        await browser.storage.local.set({ accountNotifications });
+        
+        // Also update global notification counts for backward compatibility
+        await browser.storage.local.set({
+          notificationCounts: {
+            notification: unreadCount,
+            message: unreadMessageCount,
+            total: unreadCount + unreadMessageCount,
+            timestamp: Date.now()
+          }
+        });
+      } catch (storageError) {
+        console.error('Error storing notification data:', storageError);
+      }
+      
+      return notificationData;
+    } catch (error) {
+      console.error('Error polling notifications:', error);
+      if (error.message?.includes('token') || error.message?.includes('authentication')) {
+        // Handle token refresh issues
+        await refreshBskySession(session);
+      }
+      return null;
+    }
+  }
+
+  // Function to refresh token
+  async function refreshBskySession(session: AccountSession) {
+    try {
+      const agent = new BskyAgent({ service: 'https://bsky.social' });
+      
+      // Resume with refresh token
+      const refreshed = await agent.resumeSession({
+        did: session.did,
+        handle: session.handle,
+        accessJwt: session.accessJwt,
+        refreshJwt: session.refreshJwt
+      });
+      
+      // Update stored tokens
+      await browser.storage.local.get('accounts').then(({ accounts = [] }) => {
+        const updatedAccounts = accounts.map((account: AccountSession) => {
+          if (account.did === session.did) {
+            return {
+              ...account,
+              accessJwt: refreshed.accessJwt,
+              refreshJwt: refreshed.refreshJwt
+            };
+          }
+          return account;
+        });
+        
+        return browser.storage.local.set({ accounts: updatedAccounts });
+      });
+      
+      return true;
+    } catch (error) {
+      console.error('Failed to refresh token:', error);
+      return false;
+    }
+  }
+
+  // Set up regular polling via browser alarm
+  browser.alarms.create('pollNotifications', { periodInMinutes: 1 });
+
+  browser.alarms.onAlarm.addListener(async (alarm) => {
+    if (alarm.name === 'pollNotifications') {
+      // Get all accounts and poll each one
+      const { accounts = [] } = await browser.storage.local.get('accounts');
+      
+      for (const account of accounts) {
+        await pollBlueskyNotifications(account);
+      }
+    }
+  });
+
+  // Generate a random string for PKCE
+  function generateRandomString(length: number) {
+    const array = new Uint8Array(length);
+    crypto.getRandomValues(array);
+    return Array.from(array, byte => byte.toString(16).padStart(2, '0')).join('');
+  }
+
+  // Generate code challenge for PKCE
+  async function generateCodeChallenge(verifier: string) {
+    const encoder = new TextEncoder();
+    const data = encoder.encode(verifier);
+    const digest = await crypto.subtle.digest('SHA-256', data);
+    
+    return btoa(String.fromCharCode(...new Uint8Array(digest)))
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+  }
+
+  // Function to initiate OAuth flow
+  async function startOAuthFlow() {
+    try {
+      // Generate state and PKCE values
+      const state = crypto.randomUUID();
+      const codeVerifier = generateRandomString(64);
+      const codeChallenge = await generateCodeChallenge(codeVerifier);
+      
+      // Store extension ID in localStorage so the auth page can send back to us
+      const extensionId = browser.runtime.id;
+      
+      // Store in extension storage
+      const { oauth_states = {} } = await browser.storage.local.get('oauth_states');
+      oauth_states[state] = {
+        codeVerifier,
+        createdAt: Date.now()
+      };
+      await browser.storage.local.set({ oauth_states });
+      
+      // Construct the authorization URL
+      const authUrl = `https://bsky.app/intent/oauth?client_id=${encodeURIComponent(
+        'https://notisky.symm.app/.well-known/oauth-client-metadata.json'
+      )}&redirect_uri=${encodeURIComponent(
+        'https://notisky.symm.app/auth/callback'
+      )}&state=${state}&code_challenge=${codeChallenge}&code_challenge_method=S256&scope=com.atproto.feed:read%20com.atproto.notification:read`;
+      
+      // Store extension ID in local storage on the auth page
+      const authPageUrl = `https://notisky.symm.app/?extensionId=${extensionId}&action=storeExtensionId`;
+      
+      // First, create a tab to store the extension ID
+      const storeTab = await browser.tabs.create({ url: authPageUrl });
+      
+      // Wait a moment to ensure the extension ID is stored
+      setTimeout(async () => {
+        // Now open the actual auth URL
+        await browser.tabs.update(storeTab.id!, { url: authUrl });
+      }, 1000);
+      
+      return true;
+    } catch (error) {
+      console.error('Error starting OAuth flow:', error);
+      return false;
+    }
+  }
+
+  // Handle message from popup or content script
+  browser.runtime.onMessage.addListener(async (message, sender, sendResponse) => {
+    if (message.action === 'startOAuthFlow') {
+      const success = await startOAuthFlow();
+      sendResponse({ success });
+      return true;
+    }
+  });
+
+  // Handle incoming messages from the auth page
+  browser.runtime.onMessageExternal.addListener(
+    async (message, sender, sendResponse) => {
+      // Verify sender is from our auth page
+      if (sender.url && sender.url.startsWith('https://notisky.symm.app')) {
+        console.log('Received external message:', message);
+        
+        if (message.type === 'oauth_callback') {
+          const { code, state } = message;
+          
+          // Get the state from storage to verify
+          const { oauth_states = {} } = await browser.storage.local.get('oauth_states');
+          const savedState = oauth_states[state];
+          
+          if (!savedState) {
+            sendResponse({ success: false, error: 'Invalid state' });
+            return;
+          }
+          
+          try {
+            // Exchange code for tokens with Bluesky
+            const tokenResponse = await fetch('https://bsky.social/xrpc/com.atproto.server.getServiceAuth', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                code: code,
+                code_verifier: savedState.codeVerifier
+              })
+            });
+            
+            if (!tokenResponse.ok) {
+              throw new Error('Token exchange failed');
+            }
+            
+            const tokenData = await tokenResponse.json();
+            
+            // Get user profile
+            const agent = new BskyAgent({ service: 'https://bsky.social' });
+            await agent.resumeSession(tokenData);
+            const profile = await agent.app.bsky.actor.getProfile({ actor: agent.session?.did as string });
+            
+            // Create account session
+            const accountSession = {
+              did: agent.session?.did as string,
+              handle: profile.data.handle,
+              accessJwt: tokenData.accessJwt,
+              refreshJwt: tokenData.refreshJwt
+            };
+            
+            // Store account
+            const { accounts = [] } = await browser.storage.local.get('accounts');
+            const accountExists = accounts.some(account => account.did === accountSession.did);
+            
+            if (accountExists) {
+              // Update existing account
+              const updatedAccounts = accounts.map(account => {
+                if (account.did === accountSession.did) {
+                  return accountSession;
+                }
+                return account;
+              });
+              
+              await browser.storage.local.set({ accounts: updatedAccounts });
+            } else {
+              // Add new account
+              await browser.storage.local.set({ 
+                accounts: [...accounts, accountSession] 
+              });
+            }
+            
+            // Immediately poll for notifications
+            await pollBlueskyNotifications(accountSession);
+            
+            // Clean up the state
+            delete oauth_states[state];
+            await browser.storage.local.set({ oauth_states });
+            
+            sendResponse({ success: true });
+          } catch (error) {
+            console.error('OAuth error:', error);
+            sendResponse({ success: false, error: error.message });
+          }
+        } else if (message.type === 'checkConnection') {
+          // Respond to connection check
+          sendResponse({ success: true, extensionId: browser.runtime.id });
+        }
+      }
+      
+      return true; // Required for async sendResponse
+    }
+  );
 });

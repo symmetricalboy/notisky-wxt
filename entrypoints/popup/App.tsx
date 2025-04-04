@@ -141,9 +141,10 @@ function App() {
     window.close();
   };
   
-  const openAuthPortal = () => {
-    browser.tabs.create({ url: 'https://notisky.symm.app' });
-    window.close();
+  const startAuth = async () => {
+    // Send message to background script to start OAuth flow
+    await browser.runtime.sendMessage({ action: 'startOAuthFlow' });
+    window.close(); // Close popup after initiating OAuth
   };
 
   // Function to determine badge class based on count value
@@ -218,6 +219,15 @@ function App() {
             </div>
           )}
           
+          {accounts.length === 0 && (
+            <div className="login-container">
+              <h2>Connect Your Bluesky Account</h2>
+              <button className="login-button" onClick={startAuth}>
+                Login with Bluesky
+              </button>
+            </div>
+          )}
+          
           <div className="server-status">
             <div className={`status-indicator ${serverConnected ? 'connected' : 'error'}`}>
               {serverConnected ? 'Connected to Auth Server' : 'Not connected to Auth Server'}
@@ -232,12 +242,6 @@ function App() {
           onClick={() => openBluesky('/')}
         >
           Open Bluesky
-        </button>
-        <button 
-          className="action-button secondary"
-          onClick={openAuthPortal}
-        >
-          Auth Portal
         </button>
         <button 
           className="action-button secondary"
