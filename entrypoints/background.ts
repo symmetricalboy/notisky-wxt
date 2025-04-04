@@ -1,6 +1,21 @@
 import { defineBackground } from 'wxt/utils/define-background';
-import { BskyAgent } from '@atproto/api';
+import { BskyAgent, ComAtprotoSyncSubscribeRepos, AtpAgent } from '@atproto/api';
 import { authenticateUser, storeAuthToken, getAuthToken } from '../utils/auth';
+import { initiateBlueskyAuth, exchangeCodeForToken } from '../utils/auth';
+import { browser } from 'wxt/browser';
+import {
+  AccountSession, 
+  storeAccountSession, 
+  getAccountSession, 
+  getAllAccountSessions, 
+  removeAccountSession 
+} from '../utils/storage';
+import {
+  UserPreferences,
+  loadPreferences,
+  savePreferences,
+  defaultPreferences
+} from '../utils/preferences';
 
 // Background script for Notisky Browser Extension
 export default defineBackground((context) => {
@@ -35,12 +50,9 @@ export default defineBackground((context) => {
   interface AccountSession {
     did: string;
     handle: string;
-    accessJwt: string;
-    refreshJwt: string;
+    accessToken: string;
+    refreshToken: string;
   }
-  
-  // Remove all websocket connection setup and related variables
-  const AUTH_SERVER_URL = 'https://notisky.symm.app';
   
   // Check if we're in a real browser environment (vs. build environment)
   const isRealBrowser = (() => {
@@ -54,6 +66,20 @@ export default defineBackground((context) => {
       return false;
     }
   })();
+
+  // Store notification state (last seen CID per DID)
+  let notificationState: Record<string, NotificationState> = {};
+  let currentPreferences: UserPreferences = defaultPreferences;
+  let newNotificationCount = 0; // Counter for badge
+
+  // Define structure for storing last seen notification timestamp per account
+  interface NotificationState {
+    lastSeenCid: string | null;
+    lastCheckedTimestamp: number;
+  }
+  const NOTIFICATION_STATE_KEY = 'notisky_notification_state';
+  const POLLING_INTERVAL_MINUTES = 1; // How often to check for notifications
+  const POLLING_ALARM_NAME_PREFIX = 'notisky_poll_'; // Prefix for per-account alarms
 
   // Setup a heartbeat ping handler to help detect extension context state
   if (isRealBrowser) {
@@ -164,123 +190,153 @@ export default defineBackground((context) => {
   if (isRealBrowser && browser.runtime && browser.runtime.onMessage) {
     try {
       browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
-        try {
-          console.log('Notisky: Received message from content script', message, sender);
-          
-          // First store the request timestamp in local storage for context validation
-          try {
-            browser.storage.local.set({
-              lastMessageTimestamp: Date.now(),
-              lastMessageType: message.action
-            });
-          } catch (storageError) {
-            console.error('Notisky: Error writing to storage', storageError);
-          }
+        console.log('Notisky: Received message:', message, 'from:', sender);
 
-          // Handle authentication success message from content script
-          if (message.action === 'authSuccess') {
-            console.log('Notisky: Received authentication success from content script');
-            
-            handleAuthSuccess(message.code, message.state)
-              .then(() => {
-                sendResponse({ success: true });
+        // Use a flag to indicate if sendResponse will be called asynchronously
+        let willRespondAsync = false;
+
+        // Handle different message types
+        switch (message.action) {
+          // --- Authentication --- 
+          case 'authenticate':
+            console.log('Initiating authentication flow...');
+            willRespondAsync = true; // Indicate async response
+            initiateBlueskyAuth(handleAuthCallback)
+              .then(result => {
+                // Note: initiateBlueskyAuth now just starts the flow.
+                // The actual result (tokens) comes via handleAuthCallback.
+                // We might need to adjust what this message listener responds with.
+                // Maybe just acknowledge that the flow started?
+                if (result.success) {
+                  console.log('Auth flow initiated successfully.');
+                  // Don't send tokens here, they aren't available yet.
+                  sendResponse({ success: true, message: 'Auth flow started.' });
+                } else {
+                  console.error('Failed to initiate auth flow:', result.error);
+                  sendResponse({ success: false, error: result.error });
+                }
               })
               .catch(error => {
-                console.error('Notisky: Error handling auth success:', error);
+                console.error('Error calling initiateBlueskyAuth:', error);
                 sendResponse({ success: false, error: error.message });
               });
-            
-            return true;
-          }
+            break;
           
-          // Handle authentication error message from content script
-          if (message.action === 'authError') {
-            console.error('Notisky: Authentication error from content script:', message.error);
-            sendResponse({ success: false });
-            return true;
-          }
+          // Remove handlers for old auth flow messages
+          // case 'authSuccess': 
+          // case 'authError':
 
-          // Legacy: Handle authentication response from external page
-          if (message.source === 'notisky-auth' && message.code) {
-            console.log('Notisky: Received authentication response from external page');
-            
-            handleAuthSuccess(message.code, message.state)
-              .then(() => {
-                sendResponse({ success: true });
+          // --- Account Management ---
+          case 'getAccounts': // Message to get all stored accounts (for UI)
+            willRespondAsync = true;
+            getAllAccountSessions()
+              .then(accounts => {
+                sendResponse({ success: true, accounts: accounts });
               })
               .catch(error => {
-                console.error('Notisky: Error handling auth response:', error);
+                console.error('Error fetching accounts:', error);
                 sendResponse({ success: false, error: error.message });
               });
-            
-            return true;
-          }
+            break;
+          case 'removeAccount': // Message to remove an account
+            if (!message.did) {
+              sendResponse({ success: false, error: 'Missing DID to remove account' });
+              break;
+            }
+            willRespondAsync = true;
+            removeAccountSession(message.did)
+              .then(removed => {
+                if (removed) {
+                  // Stop the client if it was running
+                  stopHeadlessClient(message.did); 
+                  sendResponse({ success: true });
+                  // Optionally update UI state immediately
+                  updateUIForAuthenticatedState(message.did); 
+                } else {
+                  sendResponse({ success: false, error: 'Failed to remove account or account not found' });
+                }
+              })
+              .catch(error => {
+                console.error('Error removing account:', error);
+                sendResponse({ success: false, error: error.message });
+              });
+            break;
 
-          // Handle different message types
-          if (message.action === 'getPreferences') {
-            sendResponse({ 
-              success: true, 
-              preferences: userPreferences 
-            });
-          } 
-          else if (message.action === 'updateNotificationCount') {
-            updateExtensionIcon(message.count);
+          // --- Preferences --- 
+          case 'getPreferences':
+            willRespondAsync = true;
+            loadPreferences().then(prefs => {
+              currentPreferences = prefs; // Update local cache on request too
+              sendResponse({ success: true, preferences: currentPreferences });
+            }).catch(e => sendResponse({ success: false, error: e.message }));
+            break;
+          case 'savePreferences':
+            if (!message.preferences) {
+              sendResponse({ success: false, error: 'Missing preferences data' });
+              break;
+            }
+            willRespondAsync = true;
+            savePreferences(message.preferences)
+              .then(async (saved) => {
+                if (saved) {
+                  // Update in-memory prefs and apply changes
+                  const oldInterval = currentPreferences.pollingIntervalMinutes;
+                  currentPreferences = { ...defaultPreferences, ...message.preferences }; // Update local cache
+                  sendResponse({ success: true });
+                  // If interval changed, update alarms
+                  if (currentPreferences.pollingIntervalMinutes !== oldInterval) {
+                    await updatePollingIntervalsOnPreferenceChange(); 
+                  }
+                  // Optionally notify other UI instances
+                  browser.runtime.sendMessage({ action: 'preferencesChanged', preferences: currentPreferences })
+                         .catch(() => {/*ignore*/});
+                } else {
+                  sendResponse({ success: false, error: 'Failed to save preferences' });
+                }
+              })
+              .catch(error => {
+                console.error('Error saving preferences via message:', error);
+                sendResponse({ success: false, error: error.message });
+              });
+            break;
+          
+          // Remove obsolete preference references from other handlers if any exist
+          
+          // --- Other Actions --- 
+          case 'updateNotificationCount':
+            // TODO: Implement icon update
+            // updateExtensionIcon(message.count);
             sendResponse({ success: true });
-          }
-          else if (message.action === 'sendNotification') {
-            sendNotification(message.title, message.message, message.type);
+            break;
+          case 'sendNotification':
+            // TODO: Implement browser notification
+            // sendNotification(message.title, message.message, message.type);
             sendResponse({ success: true });
-          }
-          else if (message.action === 'checkForUpdates') {
-            refreshBlueskyTab();
+            break;
+          case 'checkForUpdates':
+            // TODO: Implement refresh logic
+            // refreshBlueskyTab(); 
             sendResponse({ success: true });
-          }
-          else if (message.action === 'ping') {
-            // Simple ping to check if background script is alive
+            break;
+          case 'ping':
             sendResponse({ success: true, message: 'pong' });
-          }
-          else if (message.action === 'authenticate') {
-            // Handle authentication request using browser.identity
-            handleAuthentication().then(response => {
-              sendResponse(response);
-            }).catch(error => {
-              sendResponse({ 
-                success: false, 
-                error: error instanceof Error ? error.message : 'Unknown authentication error' 
-              });
-            });
-            
-            // Return true to indicate we'll send the response asynchronously
-            return true;
-          }
-          else if (message.action === 'getAuthToken') {
-            // Return the stored auth token
-            getAuthToken().then(token => {
-              sendResponse({ 
-                success: true,
-                token 
-              });
-            }).catch(error => {
-              sendResponse({ 
-                success: false, 
-                error: error instanceof Error ? error.message : 'Error retrieving auth token' 
-              });
-            });
-            
-            // Return true to indicate we'll send the response asynchronously
-            return true;
-          }
-          else {
-            console.error('Notisky: Unknown message action', message);
-            sendResponse({ success: false, error: 'Unknown action' });
-          }
-        } catch (error) {
-          console.error('Notisky: Error handling message', error);
-          sendResponse({
-            success: false,
-            error: error instanceof Error ? error.message : 'Unknown error in message handler'
-          });
+            break;
+          case 'clearNewNotificationCount':
+            console.log('Popup opened, clearing new notification count.');
+            newNotificationCount = 0;
+            updateExtensionBadge(); // Update badge immediately
+            sendResponse({ success: true });
+            break;
+          default:
+            console.warn('Unknown message action received:', message.action);
+            // Optionally send a response for unknown actions
+            // sendResponse({ success: false, error: 'Unknown action' });
+            // Or return false / undefined to indicate no response
+            return false; 
         }
+
+        // Return true to indicate that sendResponse will be called asynchronously
+        return willRespondAsync;
       });
       
       // For MV3, also register for connection attempts that content scripts might use to wake up the service worker
@@ -296,1326 +352,323 @@ export default defineBackground((context) => {
     }
   }
 
-  // Default user preferences
-  interface UserPreferences {
-    updateSiteIcon: boolean;
-    updateExtensionIcon: boolean;
-    enableNotifications: boolean;
-    keepPageAlive: boolean;
-    refreshInterval: number;
-    notificationServerUserId: string;
+  // --- Preference Handling ---
+  async function loadAndApplyPreferences() {
+    currentPreferences = await loadPreferences();
+    console.log('Loaded preferences:', currentPreferences);
+    // Initial alarm setup happens during initializeExtension
+    // Subsequent updates handled by savePreferences handler
   }
 
-  // Global variable to store user preferences
-  let userPreferences: UserPreferences = {
-    updateSiteIcon: true,
-    updateExtensionIcon: true,
-    enableNotifications: true,
-    keepPageAlive: true, 
-    refreshInterval: 1, // Default to 1 minute
-    notificationServerUserId: ''
-  };
-
-  // Load user preferences
-  function loadUserPreferences() {
-    if (!isRealBrowser) {
-      console.log('Notisky: In build mode, skipping loading user preferences');
-      return;
-    }
-
-    try {
-      browser.storage.sync.get({
-        updateSiteIcon: true,
-        updateExtensionIcon: true,
-        enableNotifications: true,
-        keepPageAlive: true,
-        refreshInterval: 1,
-        notificationServerUserId: ''
-      }).then((items) => {
-        userPreferences = items as UserPreferences;
-        console.log('Notisky: Loaded user preferences', userPreferences);
-        
-        // Initialize auto-checking if preference is enabled
-        if (userPreferences.keepPageAlive) {
-          setupAutoRefresh();
-        }
-      }).catch(error => {
-        console.error('Notisky: Error accessing storage', error);
-        // Continue with defaults if storage access fails
-        
-        // Try to recover if storage is unavailable for a temporary reason
-        setTimeout(() => {
-          loadUserPreferences();
-        }, 5000);
-      });
-    } catch (error) {
-      console.error('Notisky: Error loading preferences', error);
-      // Continue with defaults if storage access fails
-      
-      // Try to recover if storage is unavailable for a temporary reason
-      setTimeout(() => {
-        loadUserPreferences();
-      }, 5000);
-    }
-  }
-
-  // Save user preferences
-  function saveUserPreferences(prefs: Partial<UserPreferences>) {
-    if (!isRealBrowser) return;
-    
-    try {
-      browser.storage.sync.set(prefs).then(() => {
-        console.log('Notisky: Saved user preferences', prefs);
-        
-        // Update local cache
-        userPreferences = { ...userPreferences, ...prefs };
-        
-        // Check if we need to setup or clear auto-refresh
-        if ('keepPageAlive' in prefs) {
-          if (prefs.keepPageAlive) {
-            setupAutoRefresh();
-          } else {
-            clearAutoRefresh();
-          }
-        }
-        
-        // Update refresh interval if changed
-        if ('refreshInterval' in prefs && userPreferences.keepPageAlive) {
-          clearAutoRefresh();
-          setupAutoRefresh();
-        }
-      }).catch(error => {
-        console.error('Notisky: Error saving preferences', error);
-      });
-    } catch (error) {
-      console.error('Notisky: Error saving preferences', error);
-    }
-  }
-
-  // Setup the alarm for auto-refreshing Bluesky in the background
-  function setupAutoRefresh() {
-    if (!isRealBrowser) return;
-    
-    const alarmName = 'notiskyAutoRefresh';
-    
-    // Clear any existing alarm first
-    browser.alarms.clear(alarmName).then(() => {
-      // Create a new alarm
-      browser.alarms.create(alarmName, {
-        periodInMinutes: 15 // Check every 15 minutes
-      });
-      
-      console.log('Notisky: Auto-refresh alarm set for every 15 minutes');
-    });
-  }
-
-  // Clear the auto-refresh alarm
-  function clearAutoRefresh() {
-    if (!isRealBrowser) return;
-    
-    browser.alarms.clear('notiskyAutoRefresh').then((wasCleared) => {
-      if (wasCleared) {
-        console.log('Notisky: Auto-refresh alarm cleared');
-      }
-    });
-  }
-
-  // Function to find a Bluesky tab or create one
-  async function findOrCreateBlueskyTab() {
-    if (!isRealBrowser) return null;
-    
-    try {
-      // Check for existing Bluesky tabs
-      const tabs = await browser.tabs.query({
-        url: ['*://bsky.app/*', '*://*.bsky.social/*']
-      });
-      
-      if (tabs.length > 0) {
-        // Return the first found tab
-        return tabs[0];
-      } else {
-        // Create a new Bluesky tab
-        return await browser.tabs.create({
-          url: 'https://bsky.app/',
-          active: false // Create in background
-        });
-      }
-    } catch (error) {
-      console.error('Notisky: Error finding or creating Bluesky tab', error);
-      return null;
-    }
-  }
-
-  // Function to refresh a Bluesky tab or ping content script
-  async function refreshBlueskyTab() {
-    if (!isRealBrowser || !userPreferences.keepPageAlive) return;
-    
-    try {
-      // Find an existing Bluesky tab or create one
-      const tab = await findOrCreateBlueskyTab();
-      
-      if (tab && tab.id) {
-        // Send a message to the content script to check for updates
-        browser.tabs.sendMessage(tab.id, {
-          action: 'checkForUpdates'
-        }).catch(error => {
-          console.log('Notisky: Content script not responsive, refreshing tab', error);
-          
-          // If messaging fails, reload the tab
-          browser.tabs.reload(tab.id);
-        });
-      }
-    } catch (error) {
-      console.error('Notisky: Error refreshing Bluesky tab', error);
-    }
-  }
-
-  // Helper function to update the extension icon
-  function updateExtensionIcon(count: number) {
-    if (!isRealBrowser || !userPreferences.updateExtensionIcon) return;
-    
-    try {
-      if (count > 0) {
-        // Use different methods based on what's available
-        if (typeof browser.action !== 'undefined') {
-          // If action API is available (MV3)
-          setNotificationBadgeIcon(count);
-        } else if (typeof browser.browserAction !== 'undefined') {
-          // Fall back to browserAction for MV2 support
-          setNotificationBadgeIcon(count);
-        } else {
-          // No proper action API available, use text badge as fallback
-          fallbackToBadgeAPI(count);
-        }
-      } else {
-        // Reset to default icon
-        if (typeof browser.action !== 'undefined') {
-          // MV3
-          browser.action.setIcon({
-            path: {
-              16: 'icon/16.png',
-              32: 'icon/32.png',
-              48: 'icon/48.png',
-              128: 'icon/128.png'
-            }
-          }).catch(error => {
-            console.error('Notisky: Error resetting extension icon', error);
-            // Try the fallback method if the primary method fails
-            fallbackToBadgeAPI(0);
-          });
-          
-          // Also clear badge text when count is 0
-          browser.action.setBadgeText({ text: '' }).catch(error => {
-            console.error('Notisky: Error clearing badge text', error);
-          });
-        } else if (typeof browser.browserAction !== 'undefined') {
-          // MV2
-          browser.browserAction.setIcon({
-            path: {
-              16: 'icon/16.png',
-              32: 'icon/32.png',
-              48: 'icon/48.png',
-              128: 'icon/128.png'
-            }
-          }).catch(error => {
-            console.error('Notisky: Error resetting extension icon', error);
-            fallbackToBadgeAPI(0);
-          });
-          
-          browser.browserAction.setBadgeText({ text: '' }).catch(error => {
-            console.error('Notisky: Error clearing badge text', error);
-          });
-        } else {
-          // No standard API available
-          console.warn('Notisky: No action API available for resetting icon');
-        }
-      }
-    } catch (error) {
-      console.error('Notisky: Error updating extension icon', error);
-      // Try fallback method
+  // Function to update polling intervals for all active clients if preference changed
+  async function updatePollingIntervalsOnPreferenceChange() {
+    if (!browser.alarms) return;
+    const pollingInterval = currentPreferences.pollingIntervalMinutes;
+    console.log(`Applying updated polling interval: ${pollingInterval} minutes`);
+    for (const did in activeClients) {
+      const alarmName = `${POLLING_ALARM_NAME_PREFIX}${did}`;
       try {
-        fallbackToBadgeAPI(count);
-      } catch (fallbackError) {
-        console.error('Notisky: Fallback badge update also failed', fallbackError);
+        // Always clear and recreate the alarm to ensure the new period takes effect
+        console.log(`Recreating polling alarm for ${did} with new interval ${pollingInterval} minutes.`);
+        await browser.alarms.clear(alarmName);
+        // Check if client still exists before recreating alarm
+        if (activeClients[did]) { 
+          await browser.alarms.create(alarmName, {
+            periodInMinutes: pollingInterval,
+            delayInMinutes: pollingInterval // Start next poll after one new interval
+          });
+        }
+      } catch (error) {
+        console.error(`Error updating polling interval for ${did}:`, error);
       }
     }
   }
 
-  // Helper function to set the notification badge icon
-  function setNotificationBadgeIcon(count: number | string) {
+  // --- Notification State Management --- 
+  async function loadNotificationState() {
     try {
-      let iconType: string;
-      
-      // Determine icon type
-      if (typeof count === 'number') {
-        if (count > 30) {
-          iconType = '30plus';
-        } else {
-          iconType = count.toString();
-        }
-      } else {
-        iconType = count;
-      }
-      
-      // Use pre-rendered badge icon if available, or dynamically generate if not
-      if (badgeIconFilesExist(iconType)) {
-        // Use pre-rendered badge icon paths
-        browser.action.setIcon({
-          path: {
-            16: `/icon/notification/${iconType}_16.png`,
-            32: `/icon/notification/${iconType}_32.png`,
-            48: `/icon/notification/${iconType}_48.png`,
-            128: `/icon/notification/${iconType}_128.png`
-          }
-        });
-        
-        // Clear any badge text as the count is embedded in the badge icon
-        browser.action.setBadgeText({ text: '' });
-      } else {
-        // If pre-rendered badge doesn't exist, fallback to dynamic generation
-        dynamicallyGenerateNotificationBadge(typeof count === 'number' ? count : Number.parseInt(count) || 9);
-      }
+      const result = await browser.storage.local.get(NOTIFICATION_STATE_KEY);
+      notificationState = result[NOTIFICATION_STATE_KEY] || {};
+      console.log('Loaded notification state:', notificationState);
     } catch (error) {
-      console.error('Notisky: Error setting notification badge icon', error);
-      // Last resort - use badge API
-      fallbackToBadgeAPI(typeof count === 'number' ? count : Number.parseInt(count) || 9);
-    }
-  }
-  
-  // Check if the notification badge icon files exist
-  function badgeIconFilesExist(iconType: string): boolean {
-    try {
-      // In production, we have pre-generated all the badge icons (1-30 and 30+)
-      // so we can return true as they will be included in the build
-      if (process.env.NODE_ENV === 'production') {
-        return true;
-      }
-      
-      // For development, try to verify if the file exists
-      // This works in modern browsers that support fetch() for extension resources
-      const testIcon = new Image();
-      let iconExists = false;
-      
-      // Set up a promise that resolves when the image loads or fails
-      let imagePromise = new Promise<boolean>((resolve) => {
-        testIcon.onload = () => {
-          iconExists = true;
-          resolve(true);
-        };
-        
-        testIcon.onerror = () => {
-          iconExists = false;
-          resolve(false);
-        };
-        
-        // Set a timeout in case the image loading hangs
-        setTimeout(() => resolve(false), 200);
-      });
-      
-      // Try to load the badge icon
-      testIcon.src = browser.runtime.getURL(`/icon/notification/${iconType}_16.png`);
-      
-      // If imagePromise immediately resolves to true, we know the file exists
-      if (iconExists) {
-        return true;
-      }
-      
-      // Default to false in development
-      return false;
-    } catch (error) {
-      console.log('Notisky: Error checking badge icon existence, falling back to dynamic generation', error);
-      return false;
-    }
-  }
-  
-  // Function to dynamically generate a notification badge icon
-  function dynamicallyGenerateNotificationBadge(count: number) {
-    // Generate custom badge icon with notification count
-    generateBadgeIconWithCount(count).then(iconData => {
-      // If we successfully generated the icon data
-      if (Object.keys(iconData).length > 0) {
-        // Set the icon with our custom badge
-        browser.action.setIcon({ 
-          imageData: iconData
-        });
-        
-        // Clear any existing badge text since we're embedding it in the badge icon
-        browser.action.setBadgeText({ text: '' });
-      } else {
-        // Fall back to badge API if generation returned empty data
-        fallbackToBadgeAPI(count);
-      }
-    }).catch(error => {
-      console.error('Notisky: Error generating notification badge', error);
-      // Fall back to badge API
-      fallbackToBadgeAPI(count);
-    });
-  }
-  
-  // Function to generate badge icon with embedded count
-  async function generateBadgeIconWithCount(count: number): Promise<{[key: number]: ImageData}> {
-    // Create icons for all required sizes
-    const iconSizes = [16, 32, 48, 128];
-    const iconData: {[key: number]: ImageData} = {};
-    
-    try {
-      for (const size of iconSizes) {
-        // Check if OffscreenCanvas is supported
-        if (typeof OffscreenCanvas !== 'undefined') {
-          // Use OffscreenCanvas (more efficient)
-          const canvas = new OffscreenCanvas(size, size);
-          const ctx = canvas.getContext('2d');
-          
-          if (!ctx) {
-            throw new Error('Failed to get canvas context');
-          }
-          
-          // Create a transparent background
-          ctx.clearRect(0, 0, size, size);
-          
-          // Add notification badge (centered red circle with count)
-          drawBadge(ctx, size, count);
-          
-          // Get image data
-          iconData[size] = ctx.getImageData(0, 0, size, size);
-        } else {
-          // Fallback to regular Canvas for Safari and older browsers
-          const canvas = document.createElement('canvas');
-          canvas.width = size;
-          canvas.height = size;
-          const ctx = canvas.getContext('2d');
-          
-          if (!ctx) {
-            throw new Error('Failed to get canvas context');
-          }
-          
-          // Create a transparent background
-          ctx.clearRect(0, 0, size, size);
-          
-          // Add notification badge
-          drawBadge(ctx, size, count);
-          
-          // Get image data
-          iconData[size] = ctx.getImageData(0, 0, size, size);
-        }
-      }
-    } catch (error) {
-      console.error('Notisky: Error generating badge icon', error);
-      // Fall back to default badge API if icon generation fails
-      fallbackToBadgeAPI(count);
-    }
-    
-    return iconData;
-  }
-  
-  // Helper function to draw the badge on a canvas context
-  function drawBadge(ctx: CanvasRenderingContext2D, size: number, count: number) {
-    // Calculate badge size to fill most of the icon space
-    const badgeSize = Math.max(size * 0.9, 14); // 90% of icon size
-    const badgeX = size / 2; // Center horizontally
-    const badgeY = size / 2; // Center vertically
-    
-    // Draw red circle background
-    ctx.beginPath();
-    ctx.arc(badgeX, badgeY, badgeSize/2, 0, Math.PI * 2);
-    ctx.fillStyle = '#FF4A4A'; // Red badge color
-    ctx.fill();
-    
-    // Format count text
-    let countText = count.toString();
-    if (count > 30) {
-      countText = '30+';
-    }
-    
-    // Add white text
-    ctx.fillStyle = '#FFFFFF';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    
-    // Scale font size based on badge size and character count
-    const fontSize = Math.max(badgeSize * 0.5, 7); // 50% of badge size
-    ctx.font = `bold ${fontSize}px Arial`;
-    
-    // Adjust font size if text is too long
-    if (countText.length > 1) {
-      ctx.font = `bold ${fontSize * 0.8}px Arial`;
-    }
-    if (countText.length > 2) {
-      ctx.font = `bold ${fontSize * 0.7}px Arial`;
-    }
-    
-    ctx.fillText(countText, badgeX, badgeY);
-  }
-  
-  // Fallback method using badge text API
-  function fallbackToBadgeAPI(count: number) {
-    console.log('Notisky: Falling back to badge API');
-    
-    try {
-      if (count > 0) {
-        // Format badge text
-        const badgeText = count > 30 ? '30+' : count.toString();
-        
-        // Set badge text
-        browser.action.setBadgeText({ text: badgeText });
-        
-        // Set badge color
-        browser.action.setBadgeBackgroundColor({ color: '#FF4A4A' });
-        
-        // Set text color if supported
-        if (typeof browser.action.setBadgeTextColor === 'function') {
-          browser.action.setBadgeTextColor({ color: '#FFFFFF' });
-        }
-      } else {
-        // Clear badge
-        browser.action.setBadgeText({ text: '' });
-      }
-    } catch (error) {
-      console.error('Notisky: Error in badge API fallback', error);
+      console.error('Error loading notification state:', error);
+      notificationState = {};
     }
   }
 
-  // Try to recover badge state on load/reload
-  async function recoverBadgeState() {
-    if (!isRealBrowser || !userPreferences.updateExtensionIcon) {
+  async function saveNotificationState() {
+    try {
+      await browser.storage.local.set({ [NOTIFICATION_STATE_KEY]: notificationState });
+    } catch (error) {
+      console.error('Error saving notification state:', error);
+    }
+  }
+
+  function updateAccountNotificationState(did: string, lastSeenCid: string | null) {
+    notificationState[did] = {
+      lastSeenCid: lastSeenCid,
+      lastCheckedTimestamp: Date.now(),
+    };
+    saveNotificationState(); 
+  }
+
+  // --- Polling Logic --- 
+  async function pollAccountNotifications(did: string) {
+    console.log(`Polling notifications for DID: ${did}`);
+    const client = activeClients[did];
+    if (!client || !client.agent) {
+      console.warn(`No active client found for polling DID: ${did}. Skipping poll.`);
+      await browser.alarms.clear(`${POLLING_ALARM_NAME_PREFIX}${did}`).catch(e=>console.error(e));
       return;
     }
-    
+
     try {
-      // Check if we have a saved badge state
-      const storage = await browser.storage.local.get('badgeState');
-      if (storage.badgeState) {
-        console.log('Notisky: Recovering badge state');
-        
-        const { count, timestamp } = storage.badgeState;
-        
-        // Only recover if the badge state is from the last hour
-        const isRecent = Date.now() - timestamp < 60 * 60 * 1000;
-        
-        if (isRecent && count > 0) {
-          console.log('Notisky: Restoring notification count:', count);
-          // Update the icon with the saved count
-          updateExtensionIcon(count);
-        } else {
-          console.log('Notisky: Badge state is outdated, clearing');
-          // Clear outdated badge state
-          browser.storage.local.remove('badgeState');
-          
-          // Reset to default icon
-          browser.action.setIcon({ 
-            path: {
-              16: '/icon/16.png',
-              32: '/icon/32.png',
-              48: '/icon/48.png',
-              128: '/icon/128.png'
-            } 
-          });
-          
-          // Clear any badge
-          browser.action.setBadgeText({ text: '' });
-        }
-      } else {
-        console.log('Notisky: No badge state to recover');
+      const params = { limit: 30 }; 
+      const lastSeen = notificationState[did]?.lastSeenCid;
+      
+      const response = await client.agent.api.app.bsky.notification.listNotifications(params);
+      
+      if (!response.success || !response.data.notifications) {
+        console.error(`Failed to list notifications for ${did}:`, response);
+        return;
       }
-    } catch (error) {
-      console.error('Notisky: Error recovering badge state', error);
-      
-      // Make sure the icon is reset to default if recovery fails
-      browser.action.setIcon({ 
-        path: {
-          16: '/icon/16.png',
-          32: '/icon/32.png',
-          48: '/icon/48.png',
-          128: '/icon/128.png'
-        } 
-      });
-      
-      // Clear any badge
-      browser.action.setBadgeText({ text: '' });
+
+      const notifications = response.data.notifications;
+      let lastSeenIndex = -1;
+      if (lastSeen) {
+        lastSeenIndex = notifications.findIndex(n => n.cid === lastSeen);
+      }
+
+      const newNotifications = lastSeenIndex === -1 
+          ? notifications 
+          : notifications.slice(0, lastSeenIndex);
+
+      if (newNotifications.length > 0) {
+        console.log(`Found ${newNotifications.length} new notifications for ${did}`);
+        const latestCid = notifications[0].cid; 
+        updateAccountNotificationState(did, latestCid);
+
+        // Increment the badge counter
+        newNotificationCount += newNotifications.length;
+        await updateExtensionBadge(); // Update badge immediately
+
+        newNotifications.forEach(notification => {
+          sendDesktopNotification(did, notification); // Pass the full notification object
+        });
+      } else {
+        // No change in notification list, just update timestamp if needed
+        if(notificationState[did]?.lastSeenCid === lastSeen) {
+           // Only update timestamp if lastSeenCid hasn't changed by another poll instance
+           updateAccountNotificationState(did, lastSeen); 
+        }
+      }
+
+    } catch (error: any) {
+      console.error(`Error polling notifications for ${did}:`, error);
+      if (error.message?.includes('Authentication Required') || error.status === 401) {
+         console.warn(`Authentication error for ${did}. Stopping client.`);
+         await stopPollingForAccount(did);
+         stopHeadlessClient(did); // Remove from activeClients
+         await removeAccountSession(did);
+         await updateUIForAuthenticatedState(did); 
+      }
     }
   }
 
-  // Function to send a notification
-  function sendNotification(title: string, message: string, type: string = 'notification') {
-    if (!isRealBrowser || !userPreferences.enableNotifications) return;
-    
+  // --- Badge/Desktop Notifications ---
+  async function updateExtensionBadge() {
+    // Show the total count of new notifications since the last reset
+    const text = newNotificationCount > 0 ? newNotificationCount.toString() : '';
+    const color = newNotificationCount > 0 ? '#FF4A4A' : '#AAAAAA'; // Red when new, Grey otherwise
     try {
-      // Create notification options
-      const options = {
-        type: 'basic' as browser.notifications.TemplateType,
+      await browser.action.setBadgeText({ text: text });
+      await browser.action.setBadgeBackgroundColor({ color: color }); 
+    } catch(e) { console.error('Error setting badge:', e); }
+  }
+
+  function sendDesktopNotification(did: string, notification: any) {
+    if (!currentPreferences.showDesktopNotifications) return;
+
+    let title = 'New Bluesky Notification';
+    let message = 'You have new activity.'; // Default generic message
+    const handle = activeClients[did]?.agent?.session?.handle || did;
+
+    // Construct detailed message if preference is enabled
+    if (currentPreferences.showDetailedNotifications) {
+      title = `New notification for ${handle}`;
+      const authorHandle = notification.author?.handle || 'Someone';
+      switch (notification.reason) {
+        case 'like':
+          message = `${authorHandle} liked your post`;
+          // Could potentially fetch the post text if record is small enough
+          break;
+        case 'repost':
+          message = `${authorHandle} reposted your post`;
+          break;
+        case 'follow':
+          message = `${authorHandle} started following you`;
+          break;
+        case 'mention':
+          message = `${authorHandle} mentioned you in a post`;
+          break;
+        case 'reply':
+          message = `${authorHandle} replied to your post`;
+          break;
+        case 'quote':
+          message = `${authorHandle} quoted your post`;
+          break;
+        default:
+          message = `${authorHandle} ${notification.reason || 'interacted with you'}`;
+      }
+    }
+
+    console.log(`Sending notification for ${did}: ${title} - ${message}`);
+    try {
+      browser.notifications.create(`${did}_${notification.cid}`, { 
+        type: 'basic',
+        iconUrl: browser.runtime.getURL('/icon/128.png'), 
         title: title,
         message: message,
-        iconUrl: type === 'notification' 
-          ? browser.runtime.getURL('icon/notification/icon-128.png')
-          : browser.runtime.getURL('icon/message/icon-128.png')
-      };
-      
-      // Create unique ID for notification
-      const notificationId = `notisky-${type}-${Date.now()}`;
-      
-      // Show notification
-      browser.notifications.create(notificationId, options)
-        .catch(error => {
-          console.error('Notisky: Error creating notification', error);
-        });
-    } catch (error) {
-      console.error('Notisky: Error sending notification', error);
-      // Try a more basic approach if the first method fails
-      try {
-        // Simplified notification as fallback
-        const basicOptions = {
-          type: 'basic' as browser.notifications.TemplateType,
-          title: title,
-          message: message,
-          iconUrl: browser.runtime.getURL('icon/128.png')
-        };
-        
-        browser.notifications.create(`notisky-basic-${Date.now()}`, basicOptions)
-          .catch(basicError => {
-            console.error('Notisky: Error creating basic notification', basicError);
-          });
-      } catch (fallbackError) {
-        console.error('Notisky: Error sending fallback notification', fallbackError);
-      }
+        priority: 0,
+      });
+    } catch (e) { console.error('Error creating notification:', e); }
+  }
+
+  // --- Alarm Management for Polling --- 
+  async function startPollingForAccount(did: string) {
+    if (!browser.alarms) return;
+    const alarmName = `${POLLING_ALARM_NAME_PREFIX}${did}`;
+    const pollingInterval = currentPreferences.pollingIntervalMinutes;
+    try {
+      await browser.alarms.create(alarmName, {
+        periodInMinutes: pollingInterval,
+        delayInMinutes: Math.max(0.1, Math.random() * pollingInterval)
+      });
+      console.log(`Started/updated polling alarm for ${did} with interval ${pollingInterval} minutes.`);
+    } catch (error) { 
+      console.error(`Error starting polling alarm for ${did}:`, error);
     }
   }
 
-  // Initalize headless clients for all accounts
-  async function initHeadlessClients() {
-    try {
-      // Get stored accounts from browser storage
-      const { accounts = [] } = await browser.storage.local.get('accounts');
-      
-      console.log(`Initializing ${accounts.length} headless clients`);
-      
-      // Initialize a headless client for each account
-      for (const account of accounts) {
-        await initHeadlessClientForAccount(account);
-      }
-    } catch (error) {
-      console.error('Error initializing headless clients:', error);
-    }
+  async function stopPollingForAccount(did: string) {
+     if (!browser.alarms) return; 
+     const alarmName = `${POLLING_ALARM_NAME_PREFIX}${did}`;
+     try {
+       await browser.alarms.clear(alarmName);
+       console.log(`Stopped polling alarm for ${did}`);
+     } catch (error) {
+       console.error(`Error stopping polling alarm for ${did}:`, error);
+     }
   }
   
-  // Initialize a headless client for a single account
-  async function initHeadlessClientForAccount(account: AccountSession) {
-    try {
-      // Check if client already exists
-      if (activeClients[account.did]) {
-        console.log(`Headless client for ${account.handle} (${account.did}) already running`);
-        return;
+  // Central alarm listener
+  if (isRealBrowser && browser.alarms) {
+    browser.alarms.onAlarm.addListener(async (alarm) => {
+      // Remove old heartbeat/keepalive handling if not needed
+      // if (alarm.name === 'notiskyHeartbeat' || alarm.name === 'notiskyKeepAlive') { ... }
+      
+      if (alarm.name.startsWith(POLLING_ALARM_NAME_PREFIX)) {
+        const did = alarm.name.substring(POLLING_ALARM_NAME_PREFIX.length);
+        if (did && activeClients[did]) { // Ensure client still active before polling
+          await pollAccountNotifications(did);
+        }
       }
-      
-      console.log(`Initializing headless client for ${account.handle} (${account.did})`);
-      
-      // Create a new agent
-      const agent = new BskyAgent({ service: 'https://bsky.social' });
-      
-      // Resume session with existing tokens
-      try {
-        await agent.resumeSession({
-          did: account.did,
-          handle: account.handle,
-          refreshJwt: account.refreshJwt,
-          accessJwt: account.accessJwt,
-          active: true  // Add the missing 'active' property
-        });
-        
-        console.log(`Resumed session for ${account.handle} (${account.did})`);
-      } catch (resumeError) {
-        console.error(`Error resuming session for ${account.handle}:`, resumeError);
-        return;
-      }
-      
-      // Get user preferences for refresh interval
-      const { preferences } = await browser.storage.sync.get({
-        preferences: { refreshInterval: 30000 }
-      });
-      
-      // Default to 30 seconds if not specified
-      const refreshInterval = preferences.refreshInterval || 30000;
-      
-      // Initialize client state
-      activeClients[account.did] = {
-        agent,
-        interval: null,
-        lastRefresh: 0,
-        notificationData: null
-      };
-      
-      // Set up the refresh interval
-      activeClients[account.did].interval = window.setInterval(async () => {
-        await refreshNotifications(account.did);
-      }, refreshInterval);
-      
-      // Do an initial refresh
-      await refreshNotifications(account.did);
-      
-    } catch (error) {
-      console.error(`Error initializing headless client for ${account.did}:`, error);
-    }
-  }
-  
-  // Stop a headless client
-  function stopHeadlessClient(did: string) {
-    if (activeClients[did]) {
-      console.log(`Stopping headless client for ${did}`);
-      if (activeClients[did].interval !== null) {
-        clearInterval(activeClients[did].interval);
-      }
-      delete activeClients[did];
-    }
-  }
-  
-  // Stop all headless clients
-  function stopAllHeadlessClients() {
-    Object.keys(activeClients).forEach(did => {
-      stopHeadlessClient(did);
     });
   }
+
+  // --- Client Initialization / Stop --- 
   
-  // Refresh notifications for an account
-  async function refreshNotifications(did: string) {
-    if (!activeClients[did]) {
-      console.warn(`No headless client found for ${did}`);
-      return;
-    }
-    
-    const client = activeClients[did];
-    
-    try {
-      // Mark the start of refresh
-      client.lastRefresh = Date.now();
-      
-      // Get the agent
-      const agent = client.agent;
-      
-      // Check if the session is expired and needs refresh
-      if (!agent.session) {
-        console.log(`Session expired for ${did}, attempting to restore from storage`);
-        
-        // Try to get session from browser storage
-        const { accounts = [] } = await browser.storage.local.get('accounts');
-        const account = accounts.find((acc: AccountSession) => acc.did === did);
-        
-        if (!account) {
-          console.error(`No account found for ${did}, stopping headless client`);
-          stopHeadlessClient(did);
-          return;
-        }
-        
-        // Resume session with stored tokens
-        try {
-          await agent.resumeSession({
-            did: account.did,
-            handle: account.handle,
-            refreshJwt: account.refreshJwt,
-            accessJwt: account.accessJwt,
-            active: true
-          });
-          
-          console.log(`Resumed session for ${account.handle} (${account.did})`);
-          
-          // Update session in storage (in case tokens were refreshed)
-          if (agent.session) {
-            // Find account index
-            const accountIndex = accounts.findIndex((acc: AccountSession) => acc.did === did);
-            if (accountIndex !== -1) {
-              // Update tokens
-              accounts[accountIndex].accessJwt = agent.session.accessJwt || account.accessJwt;
-              accounts[accountIndex].refreshJwt = agent.session.refreshJwt || account.refreshJwt;
-              
-              // Save updated accounts
-              await browser.storage.local.set({ accounts });
-            }
-          }
-        } catch (resumeError) {
-          console.error(`Failed to resume session for ${did}, stopping headless client`, resumeError);
-          stopHeadlessClient(did);
-          return;
-        }
-      }
-      
-      // Fetch unread notification count
-      const notificationCount = await fetchUnreadNotificationCount(agent);
-      
-      // Fetch unread message count
-      const messageCount = await fetchUnreadMessageCount(agent);
-      
-      // Get current timestamp
-      const timestamp = Date.now();
-      
-      // Get account info
-      const accountInfo = {
-        did: agent.session!.did,
-        handle: agent.session!.handle
-      };
-      
-      // Fetch raw notifications
-      const notifications = await fetchRawNotifications(agent);
-      
-      // Fetch raw messages
-      const messages = await fetchRawMessages(agent);
-      
-      // Calculate total count
-      const totalCount = notificationCount + messageCount;
-      
-      // Create notification data object
-      const notificationData: NotificationData = {
-        notification: notificationCount,
-        message: messageCount,
-        total: totalCount,
-        notifications,
-        messages,
-        accountInfo,
-        timestamp
-      };
-      
-      // Store the notification data
-      client.notificationData = notificationData;
-      
-      // Process notification update
-      processNotificationUpdate([notificationData]);
-      
-    } catch (error) {
-      console.error(`Error refreshing notifications for ${did}:`, error);
-    }
-  }
-  
-  // Helper function to fetch unread notification count
-  async function fetchUnreadNotificationCount(agent: BskyAgent): Promise<number> {
-    try {
-      const response = await agent.countUnreadNotifications();
-      return response.data.count || 0;
-    } catch (error) {
-      console.error('Error fetching unread notification count:', error);
-      return 0;
-    }
-  }
-  
-  // Helper function to fetch raw notifications
-  async function fetchRawNotifications(agent: BskyAgent): Promise<any[]> {
-    try {
-      const response = await agent.listNotifications({ limit: 15 });
-      return response.data.notifications || [];
-    } catch (error) {
-      console.error('Error fetching raw notifications:', error);
-      return [];
-    }
-  }
-  
-  // Helper function to fetch unread message count
-  async function fetchUnreadMessageCount(agent: BskyAgent): Promise<number> {
-    try {
-      // Using the custom API for unread count, but need to check if it exists
-      if (agent.app?.bsky?.unspecced && typeof agent.app.bsky.unspecced.getUnreadCount === 'function') {
-        const response = await agent.app.bsky.unspecced.getUnreadCount();
-        return response.data.count || 0;
-      }
-      return 0;
-    } catch (error) {
-      console.error('Error fetching unread message count:', error);
-      return 0;
-    }
-  }
+  async function initHeadlessClientForAccount(did: string) {
+    console.log(`Initializing client for DID: ${did}`);
+    const session = await getAccountSession(did);
 
-  // REPLACE handleNotificationsUpdate with processNotificationUpdate
-  function processNotificationUpdate(notificationsData: NotificationData[]) {
-    if (!notificationsData || !Array.isArray(notificationsData) || notificationsData.length === 0) {
-      console.log('Notisky: No notification data received');
-      return;
-    }
-    
-    try {
-      // Calculate total notifications across all accounts
-      let totalCount = 0;
-      let notificationCount = 0;
-      let messageCount = 0;
-      
-      notificationsData.forEach(data => {
-        totalCount += data.total || 0;
-        notificationCount += data.notification || 0;
-        messageCount += data.message || 0;
-      });
-      
-      console.log(`Notisky: Notification update - total: ${totalCount}, notifications: ${notificationCount}, messages: ${messageCount}`);
-      
-      // Update counts in storage
-      browser.storage.local.set({
-        notificationCounts: {
-          total: totalCount,
-          notification: notificationCount,
-          message: messageCount
-        }
-      });
-      
-      // Update extension icon
-      updateExtensionIcon(totalCount);
-      
-      // Send notifications if enabled
-      if (userPreferences.enableNotifications && totalCount > 0) {
-        // Create a notification for each account that has notifications
-        notificationsData.forEach(data => {
-          if (data.total > 0) {
-            const notificationTitle = `Bluesky Notifications for @${data.accountInfo.handle}`;
-            let notificationMessage = '';
-            
-            if (data.notification > 0) {
-              notificationMessage += `${data.notification} notification${data.notification !== 1 ? 's' : ''}`;
-            }
-            
-            if (data.message > 0) {
-              if (notificationMessage) {
-                notificationMessage += ' and ';
-              }
-              notificationMessage += `${data.message} message${data.message !== 1 ? 's' : ''}`;
-            }
-            
-            sendNotification(notificationTitle, notificationMessage, 'notification');
-          }
-        });
-      }
-    } catch (error) {
-      console.error('Notisky: Error processing notification update', error);
-    }
-  }
+    if (!session) { console.error(`No session found for DID ${did}`); return; }
+    if (activeClients[did]) { console.log(`Client already active for DID ${did}`); return; }
 
-  // Send message via WebSocket 
-  function sendWebSocketMessage(message: any) {
-    // WebSocket functionality is now deprecated as we're moving to a browser extension-only model
-    console.log('Notisky: WebSocket functionality is deprecated - using direct method instead');
-    
-    // Handle any logic that previously depended on WebSocket here
-    if (message && message.type === 'subscribe') {
-      // If this was a subscribe message, we'll need to handle account updates locally
-      handleAccountsUpdate([]);
-    }
-  }
-
-  // Deprecated WebSocket setup function - no longer connects to remote servers
-  async function setupWebSocketConnection() {
-    console.log('Notisky: WebSocket connections are deprecated - using extension-only model');
-    return;
-  }
-
-  function checkWebSocketHealth() {
-    // WebSocket functionality is deprecated
-    return;
-  }
-
-  // Main initialization
-  function initialize() {
-    console.log('Notisky: Initializing background script');
-    
-    // Load user preferences
-    loadUserPreferences();
-    
-    // Set up heartbeat alarm for context persistence detection
-    if (isRealBrowser && browser.alarms) {
-      try {
-        browser.alarms.create('notiskyHeartbeat', {
-          periodInMinutes: 1
-        });
-      } catch (error) {
-        console.error('Notisky: Error creating alarm', error);
-      }
-    }
-    
-    // Always try to connect to the auth server
-    setupWebSocketConnection();
-    
-    // Set up a health check timer for WebSocket connection
-    setInterval(checkWebSocketHealth, 60000); // Check every minute
-    
-    // Set up an alarm to periodically try reconnecting if needed
-    if (isRealBrowser && browser.alarms) {
-      try {
-        browser.alarms.create('notiskyServerConnect', {
-          periodInMinutes: 5 // Check every 5 minutes
-        });
-        
-        browser.alarms.onAlarm.addListener((alarm) => {
-          if (alarm.name === 'notiskyServerConnect') {
-            checkWebSocketHealth();
-          }
-        });
-      } catch (error) {
-        console.error('Notisky: Error creating server connection alarm', error);
-      }
-    }
-    
-    // Initialize headless clients for any existing accounts
-    initHeadlessClients();
-  }
-  
-  // Call initialize on start
-  initialize();
-
-  // Listen for preference updates
-  browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (message.action === 'preferencesUpdated') {
-      console.log('Notisky: Preferences updated, reconnecting WebSocket if needed');
-      setupWebSocketConnection();
-      
-      // Update polling intervals
-      updatePollingIntervals();
-      
-      sendResponse({ success: true });
-    }
-    return true;
-  });
-  
-  // Update polling intervals based on user preferences
-  async function updatePollingIntervals() {
-    try {
-      const { preferences } = await browser.storage.sync.get({
-        preferences: { refreshInterval: 30000 }
-      });
-      
-      // Default to 30 seconds if not specified
-      const refreshInterval = preferences.refreshInterval || 30000;
-      
-      // Update intervals for all clients
-      Object.keys(activeClients).forEach(did => {
-        const client = activeClients[did];
-        
-        // Clear existing interval
-        if (client.interval !== null) {
-          clearInterval(client.interval);
-        }
-        
-        // Set new interval
-        client.interval = window.setInterval(async () => {
-          await refreshNotifications(did);
-        }, refreshInterval);
-      });
-      
-    } catch (error) {
-      console.error('Notisky: Error updating polling intervals', error);
-    }
-  }
-
-  // On startup, recover state and init
-  if (isRealBrowser) {
-    // First load preferences
-    loadUserPreferences();
-    
-    // Recover badge state
-    recoverBadgeState();
-    
-    // Register for startup events
-    if (browser.runtime && browser.runtime.onStartup) {
-      browser.runtime.onStartup.addListener(() => {
-        console.log('Notisky: Browser starting up, initializing extension');
-        loadUserPreferences();
-        recoverBadgeState();
-      });
-    }
-    
-    // Register for install/update events
-    if (browser.runtime && browser.runtime.onInstalled) {
-      browser.runtime.onInstalled.addListener((details) => {
-        console.log('Notisky: Extension installed or updated', details);
-        loadUserPreferences();
-        
-        // Create a welcome notification for new installations
-        if (details.reason === 'install') {
-          sendNotification(
-            'Notisky Installed',
-            'Thank you for installing Notisky! The extension will now show notifications for new Bluesky activity.',
-            'notification'
-          );
-        }
-      });
-    }
-  }
-
-  // Add these new functions to handle direct polling and OAuth
-
-  // Directly poll Bluesky for notifications
-  async function pollBlueskyNotifications(session: AccountSession) {
-    try {
-      const agent = new BskyAgent({ service: 'https://bsky.social' });
-      
-      // Resume the session with stored tokens
-      await agent.resumeSession({
-        did: session.did,
-        handle: session.handle,
-        accessJwt: session.accessJwt,
-        refreshJwt: session.refreshJwt
-      });
-      
-      // Get unread notification count
-      const notifications = await agent.listNotifications({
-        limit: 30
-      });
-      
-      // Handle notifications
-      const unreadCount = notifications.data.notifications.filter(
-        notification => !notification.isRead
-      ).length;
-      
-      // Get unread message count
-      let unreadMessageCount = 0;
-      try {
-        const feeds = await agent.app.bsky.feed.getTimeline({ limit: 1 });
-        if (feeds.success) {
-          const feedView = feeds.data;
-          if (feedView && feedView.view) {
-            // Check if feedView.view contains unreadCount property
-            const messages = await agent.countUnreadNotifications();
-            unreadMessageCount = messages.count;
-          }
-        }
-      } catch (messageError) {
-        console.error('Error checking unread messages:', messageError);
-      }
-      
-      // Build notification data
-      const notificationData: NotificationData = {
-        notification: unreadCount,
-        message: unreadMessageCount,
-        total: unreadCount + unreadMessageCount,
-        notifications: notifications.data.notifications,
-        messages: [], // We don't load all messages for efficiency
-        accountInfo: {
-          did: session.did,
-          handle: session.handle,
-        },
-        timestamp: Date.now()
-      };
-      
-      // Update badge and show notifications
-      updateNotificationBadge(session.did, notificationData);
-      
-      // Store the notifications data
-      try {
-        const { accountNotifications = [] } = await browser.storage.local.get('accountNotifications');
-        
-        // Find existing notifications for this account
-        const existingIndex = accountNotifications.findIndex(
-          (an: any) => an.did === session.did
-        );
-        
-        if (existingIndex >= 0) {
-          // Update existing notifications
-          accountNotifications[existingIndex] = {
+    const agent = new BskyAgent({ 
+      service: 'https://bsky.social', 
+      persistSession: (evt, session) => {
+        if (evt === 'update' && session) {
+          console.log(`Session updated for ${session.handle}, saving...`);
+          const updatedSession: AccountSession = {
             did: session.did,
             handle: session.handle,
-            notification: notificationData.notification,
-            message: notificationData.message,
-            total: notificationData.total,
-            timestamp: notificationData.timestamp
+            accessToken: session.accessJwt,
+            refreshToken: session.refreshJwt,
           };
-        } else {
-          // Add new notifications
-          accountNotifications.push({
-            did: session.did,
-            handle: session.handle,
-            notification: notificationData.notification,
-            message: notificationData.message,
-            total: notificationData.total,
-            timestamp: notificationData.timestamp
-          });
+          storeAccountSession(updatedSession);
+        } else if (evt === 'expired') {
+           console.warn(`Session expired event for ${did}. Stopping client.`);
+           stopPollingForAccount(did);
+           stopHeadlessClient(did); 
+           removeAccountSession(did);
+           updateUIForAuthenticatedState(did);
         }
-        
-        // Save to storage
-        await browser.storage.local.set({ accountNotifications });
-        
-        // Also update global notification counts for backward compatibility
-        await browser.storage.local.set({
-          notificationCounts: {
-            notification: unreadCount,
-            message: unreadMessageCount,
-            total: unreadCount + unreadMessageCount,
-            timestamp: Date.now()
-          }
-        });
-      } catch (storageError) {
-        console.error('Error storing notification data:', storageError);
       }
-      
-      return notificationData;
-    } catch (error) {
-      console.error('Error polling notifications:', error);
-      if (error.message?.includes('token') || error.message?.includes('authentication')) {
-        // Handle token refresh issues
-        await refreshBskySession(session);
-      }
-      return null;
-    }
-  }
-
-  // Function to refresh token
-  async function refreshBskySession(session: AccountSession) {
+    }); 
+    
     try {
-      const agent = new BskyAgent({ service: 'https://bsky.social' });
-      
-      // Resume with refresh token
-      const refreshed = await agent.resumeSession({
+      await agent.resumeSession({
+        accessJwt: session.accessToken,
+        refreshJwt: session.refreshToken,
         did: session.did,
-        handle: session.handle,
-        accessJwt: session.accessJwt,
-        refreshJwt: session.refreshJwt
+        handle: session.handle
       });
-      
-      // Update stored tokens
-      await browser.storage.local.get('accounts').then(({ accounts = [] }) => {
-        const updatedAccounts = accounts.map((account: AccountSession) => {
-          if (account.did === session.did) {
-            return {
-              ...account,
-              accessJwt: refreshed.accessJwt,
-              refreshJwt: refreshed.refreshJwt
-            };
-          }
-          return account;
-        });
-        
-        return browser.storage.local.set({ accounts: updatedAccounts });
-      });
-      
-      return true;
-    } catch (error) {
-      console.error('Failed to refresh token:', error);
-      return false;
-    }
-  }
-
-  // Set up regular polling via browser alarm
-  browser.alarms.create('pollNotifications', { periodInMinutes: 1 });
-
-  browser.alarms.onAlarm.addListener(async (alarm) => {
-    if (alarm.name === 'pollNotifications') {
-      // Get all accounts and poll each one
-      const { accounts = [] } = await browser.storage.local.get('accounts');
-      
-      for (const account of accounts) {
-        await pollBlueskyNotifications(account);
-      }
-    }
-  });
-
-  /**
-   * Handle the authentication flow using browser.identity
-   * Replaces the previous protocol handler approach
-   */
-  async function handleAuthentication() {
-    try {
-      // Start the authentication flow using the browser.identity API
-      const authResponse = await authenticateUser();
-      
-      if (authResponse.success && authResponse.token) {
-        // Store the token for future use
-        await storeAuthToken(authResponse.token);
-        
-        // Return success response
-        return { 
-          success: true,
-          token: authResponse.token
-        };
-      } else {
-        return {
-          success: false,
-          error: authResponse.error || 'Authentication failed'
-        };
-      }
-    } catch (error) {
-      console.error('Notisky: Authentication error', error);
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : 'Unknown authentication error'
+      activeClients[did] = {
+        agent: agent,
+        // Remove interval/lastRefresh if using alarms primarily
+        intervalId: null, 
+        lastRefreshTime: 0, 
+        notificationData: null,
+        accountDid: did,
       };
+      console.log(`Initialized client for ${session.handle}`);
+      await startPollingForAccount(did);
+      await updateExtensionBadge(); // Update badge after adding a client
+    } catch (error) {
+      console.error(`Failed to resume session for ${did}:`, error);
+      // Remove session if resume fails (likely invalid tokens)
+      await removeAccountSession(did);
+      await updateUIForAuthenticatedState(did);
     }
   }
 
-  /**
-   * Handle successful authentication from the content script or external page
-   */
-  async function handleAuthSuccess(code: string, state: string) {
-    try {
-      // Verify the expected state
-      const { auth_state_expected, auth_code_verifier } = await browser.storage.local.get([
-        'auth_state_expected',
-        'auth_code_verifier'
-      ]);
-      
-      if (state !== auth_state_expected) {
-        throw new Error('State mismatch in authentication flow');
-      }
-      
-      // Exchange the code for a token
-      const response = await fetch(`${AUTH_SERVER_URL}/api/token`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          code,
-          code_verifier: auth_code_verifier,
-          redirect_uri: `${AUTH_SERVER_URL}/auth/callback`,
-          client_id: 'notisky-extension',
-          grant_type: 'authorization_code'
-        })
-      });
-      
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.error || 'Failed to exchange code for token');
-      }
-      
-      const tokenData = await response.json();
-      
-      // Store the auth token
-      await storeAuthToken(tokenData.access_token);
-      
-      // Clean up the stored state data
-      await browser.storage.local.remove([
-        'auth_state_expected',
-        'auth_code_verifier',
-        'auth_flow_started'
-      ]);
-      
-      // Update user interface to show authenticated state
-      await updateUIForAuthenticatedState();
-      
-      return true;
-    } catch (error) {
-      console.error('Error in handleAuthSuccess:', error);
-      throw error;
+  function stopHeadlessClient(did: string) {
+    if (activeClients[did]) {
+      // Stop alarm first
+      stopPollingForAccount(did); 
+      delete activeClients[did];
+      console.log(`Stopped client for DID: ${did}`);
+      updateExtensionBadge(); // Update badge after removing client
+    } else {
+      console.warn(`Attempted to stop non-existent client for DID: ${did}`);
     }
   }
 
-  /**
-   * Update the UI to reflect authenticated state
-   */
-  async function updateUIForAuthenticatedState() {
-    try {
-      // Update the extension icon
-      browser.action.setIcon({
-        path: {
-          16: '/icon/16-active.png',
-          48: '/icon/48-active.png',
-          128: '/icon/128-active.png'
-        }
-      });
-      
-      // Update the extension badge
-      browser.action.setBadgeText({ text: '' });
-      
-      // Set a storage flag to indicate authentication state
-      await browser.storage.local.set({ isAuthenticated: true });
-      
-      // Notify any open popup or options pages
-      browser.runtime.sendMessage({
-        action: 'authStateChanged',
-        isAuthenticated: true
-      }).catch(() => {
-        // Ignore errors if no listeners
-      });
-      
-    } catch (error) {
-      console.error('Error updating UI for authenticated state:', error);
+  // --- Initialization --- 
+  async function initializeExtension() {
+    console.log('Initializing Notisky background script...');
+    // Load state/prefs first
+    await Promise.all([
+      loadNotificationState(),
+      loadPreferences().then(prefs => { currentPreferences = prefs; })
+    ]);
+    const sessions = await getAllAccountSessions();
+    console.log(`Found ${Object.keys(sessions).length} stored sessions.`);
+    // Initialize clients without waiting for all to finish (can be slow)
+    for (const did in sessions) { 
+      initHeadlessClientForAccount(did).catch(e => console.error(`Init error for ${did}`, e));
     }
+    // Set initial badge (likely empty as count is 0)
+    await updateExtensionBadge();
+    console.log('Notisky background script initialized.');
   }
+
+  // Call initialization only in a real browser environment
+  if (isRealBrowser) {
+    initializeExtension().catch(err => {
+      console.error('Failed to initialize Notisky background script:', err);
+    });
+  }
+
 });
