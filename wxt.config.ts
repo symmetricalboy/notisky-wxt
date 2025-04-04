@@ -36,14 +36,6 @@ export default defineConfig({
         id: 'notisky@extension.app'
       }
     },
-    // Protocol handler for auth callback
-    protocol_handlers: [
-      {
-        protocol: 'notisky',
-        name: 'Notisky Authentication Handler',
-        uriTemplate: 'https://notisky.symm.app/auth-handler.html?uri=%s'
-      }
-    ],
     // Allow the GitHub Pages site to communicate with the extension
     externally_connectable: {
       matches: ['*://notisky.symm.app/*']

@@ -1,5 +1,6 @@
 import { defineBackground } from 'wxt/utils/define-background';
 import { BskyAgent } from '@atproto/api';
+import { authenticateUser, storeAuthToken, getAuthToken } from '../utils/auth';
 
 // Background script for Notisky Browser Extension
 export default defineBackground((context) => {
@@ -199,27 +200,48 @@ export default defineBackground((context) => {
             // Simple ping to check if background script is alive
             sendResponse({ success: true, message: 'pong' });
           }
+          else if (message.action === 'authenticate') {
+            // Handle authentication request using browser.identity
+            handleAuthentication().then(response => {
+              sendResponse(response);
+            }).catch(error => {
+              sendResponse({ 
+                success: false, 
+                error: error instanceof Error ? error.message : 'Unknown authentication error' 
+              });
+            });
+            
+            // Return true to indicate we'll send the response asynchronously
+            return true;
+          }
+          else if (message.action === 'getAuthToken') {
+            // Return the stored auth token
+            getAuthToken().then(token => {
+              sendResponse({ 
+                success: true,
+                token 
+              });
+            }).catch(error => {
+              sendResponse({ 
+                success: false, 
+                error: error instanceof Error ? error.message : 'Error retrieving auth token' 
+              });
+            });
+            
+            // Return true to indicate we'll send the response asynchronously
+            return true;
+          }
           else {
             console.error('Notisky: Unknown message action', message);
             sendResponse({ success: false, error: 'Unknown action' });
           }
         } catch (error) {
-          console.error('Notisky: Error handling message', message, error);
-          try {
-            sendResponse({ success: false, error: error.message });
-          } catch (responseError) {
-            console.error('Notisky: Error sending response', responseError);
-            // Try to send a simpler response if JSON serialization failed
-            try {
-              sendResponse({ success: false, error: "Error processing request" });
-            } catch {
-              // Last resort, give up gracefully
-            }
-          }
+          console.error('Notisky: Error handling message', error);
+          sendResponse({
+            success: false,
+            error: error instanceof Error ? error.message : 'Unknown error in message handler'
+          });
         }
-        
-        // Return true to indicate async response
-        return true;
       });
       
       // For MV3, also register for connection attempts that content scripts might use to wake up the service worker
@@ -1435,168 +1457,36 @@ export default defineBackground((context) => {
     }
   });
 
-  // Generate a random string for PKCE
-  function generateRandomString(length: number) {
-    const array = new Uint8Array(length);
-    crypto.getRandomValues(array);
-    return Array.from(array, byte => byte.toString(16).padStart(2, '0')).join('');
-  }
-
-  // Generate code challenge for PKCE
-  async function generateCodeChallenge(verifier: string) {
-    const encoder = new TextEncoder();
-    const data = encoder.encode(verifier);
-    const digest = await crypto.subtle.digest('SHA-256', data);
-    
-    return btoa(String.fromCharCode(...new Uint8Array(digest)))
-      .replace(/\+/g, '-')
-      .replace(/\//g, '_')
-      .replace(/=+$/, '');
-  }
-
-  // Function to initiate OAuth flow
-  async function startOAuthFlow() {
+  /**
+   * Handle the authentication flow using browser.identity
+   * Replaces the previous protocol handler approach
+   */
+  async function handleAuthentication() {
     try {
-      // Generate state and PKCE values
-      const state = crypto.randomUUID();
-      const codeVerifier = generateRandomString(64);
-      const codeChallenge = await generateCodeChallenge(codeVerifier);
+      // Start the authentication flow using the browser.identity API
+      const authResponse = await authenticateUser();
       
-      // Store extension ID in localStorage so the auth page can send back to us
-      const extensionId = browser.runtime.id;
-      
-      // Store in extension storage
-      const { oauth_states = {} } = await browser.storage.local.get('oauth_states');
-      oauth_states[state] = {
-        codeVerifier,
-        createdAt: Date.now()
-      };
-      await browser.storage.local.set({ oauth_states });
-      
-      // Construct the authorization URL
-      const authUrl = `https://bsky.app/intent/oauth?client_id=${encodeURIComponent(
-        'https://notisky.symm.app/.well-known/oauth-client-metadata.json'
-      )}&redirect_uri=${encodeURIComponent(
-        'https://notisky.symm.app/auth/callback'
-      )}&state=${state}&code_challenge=${codeChallenge}&code_challenge_method=S256&scope=com.atproto.feed:read%20com.atproto.notification:read`;
-      
-      // Store extension ID in local storage on the auth page
-      const authPageUrl = `https://notisky.symm.app/?extensionId=${extensionId}&action=storeExtensionId`;
-      
-      // First, create a tab to store the extension ID
-      const storeTab = await browser.tabs.create({ url: authPageUrl });
-      
-      // Wait a moment to ensure the extension ID is stored
-      setTimeout(async () => {
-        // Now open the actual auth URL
-        await browser.tabs.update(storeTab.id!, { url: authUrl });
-      }, 1000);
-      
-      return true;
+      if (authResponse.success && authResponse.token) {
+        // Store the token for future use
+        await storeAuthToken(authResponse.token);
+        
+        // Return success response
+        return { 
+          success: true,
+          token: authResponse.token
+        };
+      } else {
+        return {
+          success: false,
+          error: authResponse.error || 'Authentication failed'
+        };
+      }
     } catch (error) {
-      console.error('Error starting OAuth flow:', error);
-      return false;
+      console.error('Notisky: Authentication error', error);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown authentication error'
+      };
     }
   }
-
-  // Handle message from popup or content script
-  browser.runtime.onMessage.addListener(async (message, sender, sendResponse) => {
-    if (message.action === 'startOAuthFlow') {
-      const success = await startOAuthFlow();
-      sendResponse({ success });
-      return true;
-    }
-  });
-
-  // Handle incoming messages from the auth page
-  browser.runtime.onMessageExternal.addListener(
-    async (message, sender, sendResponse) => {
-      // Verify sender is from our auth page
-      if (sender.url && sender.url.startsWith('https://notisky.symm.app')) {
-        console.log('Received external message:', message);
-        
-        if (message.type === 'oauth_callback') {
-          const { code, state } = message;
-          
-          // Get the state from storage to verify
-          const { oauth_states = {} } = await browser.storage.local.get('oauth_states');
-          const savedState = oauth_states[state];
-          
-          if (!savedState) {
-            sendResponse({ success: false, error: 'Invalid state' });
-            return;
-          }
-          
-          try {
-            // Exchange code for tokens with Bluesky
-            const tokenResponse = await fetch('https://bsky.social/xrpc/com.atproto.server.getServiceAuth', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                code: code,
-                code_verifier: savedState.codeVerifier
-              })
-            });
-            
-            if (!tokenResponse.ok) {
-              throw new Error('Token exchange failed');
-            }
-            
-            const tokenData = await tokenResponse.json();
-            
-            // Get user profile
-            const agent = new BskyAgent({ service: 'https://bsky.social' });
-            await agent.resumeSession(tokenData);
-            const profile = await agent.app.bsky.actor.getProfile({ actor: agent.session?.did as string });
-            
-            // Create account session
-            const accountSession = {
-              did: agent.session?.did as string,
-              handle: profile.data.handle,
-              accessJwt: tokenData.accessJwt,
-              refreshJwt: tokenData.refreshJwt
-            };
-            
-            // Store account
-            const { accounts = [] } = await browser.storage.local.get('accounts');
-            const accountExists = accounts.some(account => account.did === accountSession.did);
-            
-            if (accountExists) {
-              // Update existing account
-              const updatedAccounts = accounts.map(account => {
-                if (account.did === accountSession.did) {
-                  return accountSession;
-                }
-                return account;
-              });
-              
-              await browser.storage.local.set({ accounts: updatedAccounts });
-            } else {
-              // Add new account
-              await browser.storage.local.set({ 
-                accounts: [...accounts, accountSession] 
-              });
-            }
-            
-            // Immediately poll for notifications
-            await pollBlueskyNotifications(accountSession);
-            
-            // Clean up the state
-            delete oauth_states[state];
-            await browser.storage.local.set({ oauth_states });
-            
-            sendResponse({ success: true });
-          } catch (error) {
-            console.error('OAuth error:', error);
-            sendResponse({ success: false, error: error.message });
-          }
-        } else if (message.type === 'checkConnection') {
-          // Respond to connection check
-          sendResponse({ success: true, extensionId: browser.runtime.id });
-        }
-      }
-      
-      return true; // Required for async sendResponse
-    }
-  );
 });

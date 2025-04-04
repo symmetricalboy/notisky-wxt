@@ -21,6 +21,7 @@ function App() {
   const [accounts, setAccounts] = useState<AccountInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [serverConnected, setServerConnected] = useState<boolean>(false);
+  const [authenticating, setAuthenticating] = useState<boolean>(false);
 
   useEffect(() => {
     // Load accounts and notification data
@@ -142,9 +143,23 @@ function App() {
   };
   
   const startAuth = async () => {
-    // Send message to background script to start OAuth flow
-    await browser.runtime.sendMessage({ action: 'startOAuthFlow' });
-    window.close(); // Close popup after initiating OAuth
+    try {
+      setAuthenticating(true);
+      
+      // Use our new authentication method with browser.identity
+      const result = await browser.runtime.sendMessage({ action: 'authenticate' });
+      
+      if (result.success) {
+        // Authentication successful, reload data
+        window.location.reload();
+      } else {
+        console.error('Authentication failed:', result.error);
+        setAuthenticating(false);
+      }
+    } catch (error) {
+      console.error('Error during authentication:', error);
+      setAuthenticating(false);
+    }
   };
 
   // Function to determine badge class based on count value
@@ -163,6 +178,11 @@ function App() {
         <div className="loading-container">
           <div className="loading-spinner"></div>
           <p>Checking for notifications...</p>
+        </div>
+      ) : authenticating ? (
+        <div className="loading-container">
+          <div className="loading-spinner"></div>
+          <p>Authenticating...</p>
         </div>
       ) : (
         <>
@@ -211,54 +231,48 @@ function App() {
                   </div>
                 </div>
               ))}
+              
+              <div className="action-buttons">
+                <button 
+                  className="action-button primary" 
+                  onClick={() => openBluesky('/')}
+                >
+                  Open Bluesky
+                </button>
+                <button 
+                  className="action-button secondary" 
+                  onClick={openOptions}
+                >
+                  Settings
+                </button>
+              </div>
             </div>
           ) : (
-            <div className="no-accounts">
-              <p>No Bluesky accounts connected.</p>
-              <p>Connect your accounts through the Auth Portal.</p>
+            <div className="no-accounts-container">
+              <p>No Bluesky accounts found.</p>
+              <p className="server-status">
+                Server status: {serverConnected ? <span className="status-online">Online</span> : <span className="status-offline">Offline</span>}
+              </p>
+              
+              <div className="action-buttons">
+                <button 
+                  className="action-button primary" 
+                  onClick={startAuth}
+                  disabled={!serverConnected}
+                >
+                  Connect Account
+                </button>
+                <button 
+                  className="action-button secondary" 
+                  onClick={openOptions}
+                >
+                  Settings
+                </button>
+              </div>
             </div>
           )}
-          
-          {accounts.length === 0 && (
-            <div className="login-container">
-              <h2>Connect Your Bluesky Account</h2>
-              <button className="login-button" onClick={startAuth}>
-                Login with Bluesky
-              </button>
-            </div>
-          )}
-          
-          <div className="server-status">
-            <div className={`status-indicator ${serverConnected ? 'connected' : 'error'}`}>
-              {serverConnected ? 'Connected to Auth Server' : 'Not connected to Auth Server'}
-            </div>
-          </div>
         </>
       )}
-      
-      <div className="popup-actions">
-        <button 
-          className="action-button primary"
-          onClick={() => openBluesky('/')}
-        >
-          Open Bluesky
-        </button>
-        <button 
-          className="action-button secondary"
-          onClick={openOptions}
-        >
-          Options
-        </button>
-      </div>
-      
-      <footer className="popup-footer">
-        <p className="footer-slogan">Free & open source, for all, forever.</p>
-        <p className="footer-contact">
-          Feedback, suggestions, assistance, & updates:
-          <a href="#" onClick={(e) => { e.preventDefault(); openBluesky('/profile/symm.app'); }}>@symm.app</a>
-        </p>
-        <p className="footer-copyright">Copyright (c) 2025 Dylan Gregori Singer (symmetricalboy)</p>
-      </footer>
     </div>
   );
 }
