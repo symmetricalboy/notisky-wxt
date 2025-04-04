@@ -40,8 +40,15 @@ function App() {
             });
             
             if (response.ok) {
-              const data = await response.json();
-              setServerConnected(data.success === true);
+              // Check content type header to ensure it's JSON
+              const contentType = response.headers.get('content-type');
+              if (contentType && contentType.includes('application/json')) {
+                const data = await response.json();
+                setServerConnected(data.success === true);
+              } else {
+                console.error('Server returned non-JSON response');
+                setServerConnected(false);
+              }
             } else {
               setServerConnected(false);
             }
