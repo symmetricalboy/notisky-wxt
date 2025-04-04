@@ -27,7 +27,7 @@ export default defineConfig({
     web_accessible_resources: [
       {
         resources: ['assets/*', 'icon/*'],
-        matches: ['*://bsky.app/*', '*://*.bsky.social/*']
+        matches: ['*://bsky.app/*', '*://*.bsky.social/*', '*://notisky.symm.app/*']
       }
     ],
     // Include Firefox specific settings
@@ -39,7 +39,16 @@ export default defineConfig({
     // Allow the GitHub Pages site to communicate with the extension
     externally_connectable: {
       matches: ['*://notisky.symm.app/*']
-    }
+    },
+    // Add OAuth2 configuration for smoother identity flow
+    oauth2: {
+      client_id: 'notisky-extension',
+      scopes: [
+        'read',
+        'write'
+      ]
+    },
+    key: process.env.EXTENSION_KEY || undefined
   },
   webExt: {
     startUrls: ['https://bsky.app/']

@@ -81,19 +81,15 @@ export async function authenticateUser(): Promise<AuthResponse> {
         success: true,
         token: tokenResponse.access_token
       };
-    } catch (authFlowError) {
+    } catch (authFlowError: any) {
       console.error('Auth flow error:', authFlowError);
       
-      // Try an alternative approach if the standard flow fails
-      // Open the auth URL in a new tab
-      if (authFlowError.message.includes('Authorization page could not be loaded')) {
-        console.log('Trying alternative authentication method...');
-        return await alternativeAuthFlow(authUrl.toString(), state);
-      }
-      
-      throw authFlowError;
+      // More aggressively fall back to the alternative auth method
+      // We'll use this for any error, not just the specific "Authorization page could not be loaded" error
+      console.log('Standard auth flow failed, switching to alternative method...');
+      return await alternativeAuthFlow(authUrl.toString(), state);
     }
-  } catch (error) {
+  } catch (error: any) {
     console.error('Authentication error:', error);
     return {
       success: false,
@@ -144,6 +140,14 @@ async function alternativeAuthFlow(authUrl: string, state: string): Promise<Auth
     
     // Register the message listener
     browser.runtime.onMessage.addListener(messageListener);
+    
+    // Open the auth URL in a new tab and add a notification to help users understand what to do
+    browser.notifications.create({
+      type: 'basic',
+      iconUrl: '/icon48.png',
+      title: 'Notisky Authentication',
+      message: 'A new tab has been opened for authentication. Please complete the process there.'
+    }).catch(err => console.error('Could not create notification:', err));
     
     // Open the auth URL in a new tab
     browser.tabs.create({ url: authUrl });
