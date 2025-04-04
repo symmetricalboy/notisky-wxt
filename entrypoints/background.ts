@@ -177,6 +177,13 @@ export default defineBackground((context) => {
             console.error('Notisky: Error writing to storage', storageError);
           }
 
+          // Handle authentication response from external page
+          if (message.source === 'notisky-auth' && message.code) {
+            console.log('Notisky: Received authentication response from external page');
+            sendResponse({ success: true });
+            return true;
+          }
+
           // Handle different message types
           if (message.action === 'getPreferences') {
             sendResponse({ 

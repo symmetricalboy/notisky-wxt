@@ -31,32 +31,67 @@ function App() {
         
         // Check if we have a connection to the auth server
         const checkServerConnection = async () => {
-          try {
-            const response = await fetch('https://notisky.symm.app/api/status', {
-              method: 'GET',
-              headers: {
-                'Content-Type': 'application/json'
-              },
-              mode: 'cors'
-            });
-            
-            if (response.ok) {
-              // Check content type header to ensure it's JSON
-              const contentType = response.headers.get('content-type');
-              if (contentType && contentType.includes('application/json')) {
-                const data = await response.json();
-                setServerConnected(data.success === true);
-              } else {
-                console.error('Server returned non-JSON response');
-                setServerConnected(false);
+          // Try up to 3 times with increasing backoff
+          const MAX_RETRIES = 3;
+          let retryCount = 0;
+          let lastError = null;
+
+          while (retryCount < MAX_RETRIES) {
+            try {
+              // Create an AbortController to timeout the request after 5 seconds
+              const controller = new AbortController();
+              const timeoutId = setTimeout(() => controller.abort(), 5000);
+              
+              try {
+                // Use status endpoint that should return minimal data
+                const response = await fetch('https://notisky.symm.app/api/health', {
+                  method: 'GET',
+                  headers: {
+                    'Accept': 'application/json, text/plain, */*'
+                  },
+                  mode: 'cors',
+                  signal: controller.signal
+                });
+                
+                clearTimeout(timeoutId);
+                
+                // Any successful response means server is up
+                if (response.status >= 200 && response.status < 500) {
+                  console.log(`Server is up (status: ${response.status})`);
+                  setServerConnected(true);
+                  return;
+                } else {
+                  lastError = `Server error status: ${response.status}`;
+                  console.error(lastError);
+                }
+              } catch (fetchError) {
+                clearTimeout(timeoutId);
+                lastError = fetchError.message;
+                if (fetchError.name === 'AbortError') {
+                  console.error('Server connection request timed out');
+                } else {
+                  console.error('Fetch error:', fetchError);
+                }
               }
-            } else {
-              setServerConnected(false);
+            } catch (error) {
+              lastError = error instanceof Error ? error.message : String(error);
+              console.error('Error in server connection check:', error);
             }
-          } catch (error) {
-            console.error('Error checking server connection:', error);
-            setServerConnected(false);
+
+            // Increase retry count
+            retryCount++;
+            
+            // If we're going to retry, wait with exponential backoff
+            if (retryCount < MAX_RETRIES) {
+              const backoffMs = 1000 * Math.pow(2, retryCount - 1);
+              console.log(`Retrying connection check in ${backoffMs}ms (attempt ${retryCount + 1}/${MAX_RETRIES})`);
+              await new Promise(resolve => setTimeout(resolve, backoffMs));
+            }
           }
+
+          // If we get here, all retries failed
+          console.error(`Server connection failed after ${MAX_RETRIES} attempts. Last error: ${lastError}`);
+          setServerConnected(false);
         };
         
         // Get the accounts from storage
