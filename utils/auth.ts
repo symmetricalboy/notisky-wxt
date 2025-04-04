@@ -1,15 +1,18 @@
 /**
- * Authentication utility for Notisky using browser.identity API
- * Cross-browser compatible solution that works in Chrome, Firefox, and Safari
+ * Authentication utility for Notisky using a direct OAuth flow
+ * Implementation inspired by atcute's OAuth approach
  */
 
 // Auth configuration
 const AUTH_CONFIG = {
   // The URL to the authorization endpoint
-  authUrl: 'https://notisky.symm.app/auth',
+  authUrl: 'https://bsky.app/intent/oauth',
+  // Base URL for the auth server
+  serverBaseUrl: 'https://notisky.symm.app',
   // The redirect URL that will receive the authorization code
-  // This should match what's configured on your server
-  redirectUrl: 'https://notisky.symm.app/auth/callback'
+  redirectUrl: 'https://notisky.symm.app/auth/callback',
+  // Client ID for the application
+  clientId: 'https://notisky.symm.app/.well-known/oauth-client-metadata.json'
 };
 
 /**
@@ -22,75 +25,34 @@ export interface AuthResponse {
 }
 
 /**
- * Initiates the browser authentication flow using identity API
- * Works across browsers thanks to WXT's unified API
+ * Initiates the authorization flow using a direct tab-based approach
+ * This avoids using browser.identity which can be problematic in extensions
  */
 export async function authenticateUser(): Promise<AuthResponse> {
   try {
-    // Check if identity API is available
-    if (!browser.identity) {
-      throw new Error('Identity API not available in this browser');
-    }
-
-    // Generate a random state parameter to prevent CSRF
-    const state = Math.random().toString(36).substring(2, 15);
-
-    // Store state in local storage to verify during callback
-    await browser.storage.local.set({ 'auth_state': state });
-
-    // Construct the full auth URL with necessary parameters
-    const authUrl = new URL(AUTH_CONFIG.authUrl);
-    authUrl.searchParams.append('response_type', 'code');
-    authUrl.searchParams.append('redirect_uri', AUTH_CONFIG.redirectUrl);
-    authUrl.searchParams.append('state', state);
-    authUrl.searchParams.append('client_id', 'notisky-extension');
-
-    console.log('Starting auth flow with URL:', authUrl.toString());
-
-    try {
-      // Launch the web authentication flow
-      const responseUrl = await browser.identity.launchWebAuthFlow({
-        url: authUrl.toString(),
-        interactive: true
-      });
-
-      console.log('Received auth response URL:', responseUrl);
-
-      // Parse response URL to extract the authorization code and state
-      const response = new URL(responseUrl);
-      const code = response.searchParams.get('code');
-      const returnedState = response.searchParams.get('state');
-
-      // Verify the state parameter to prevent CSRF attacks
-      const { auth_state } = await browser.storage.local.get('auth_state');
-      if (returnedState !== auth_state) {
-        throw new Error('State mismatch, possible CSRF attack');
-      }
-
-      // Clear the stored state
-      await browser.storage.local.remove('auth_state');
-
-      if (!code) {
-        throw new Error('No authorization code received');
-      }
-
-      // Exchange the code for an access token
-      const tokenResponse = await exchangeCodeForToken(code);
-      
-      return {
-        success: true,
-        token: tokenResponse.access_token
-      };
-    } catch (authFlowError: any) {
-      console.error('Auth flow error:', authFlowError);
-      
-      // More aggressively fall back to the alternative auth method
-      // We'll use this for any error, not just the specific "Authorization page could not be loaded" error
-      console.log('Standard auth flow failed, switching to alternative method...');
-      return await alternativeAuthFlow(authUrl.toString(), state);
-    }
+    console.log('Starting direct authentication flow');
+    
+    // Generate state and PKCE values
+    const state = generateRandomString(16);
+    const codeVerifier = generateRandomString(64);
+    const codeChallenge = await generateCodeChallenge(codeVerifier);
+    
+    // Store auth state data
+    await storeAuthState(state, codeVerifier);
+    
+    // Set up the message listener before opening the tab
+    const authPromise = setupAuthListener(state);
+    
+    // Build the authorization URL with PKCE challenge
+    const authUrl = buildAuthUrl(state, codeChallenge);
+    
+    // Open the auth URL in a new tab
+    await browser.tabs.create({ url: authUrl });
+    
+    // Wait for the auth result from the listener
+    return await authPromise;
   } catch (error: any) {
-    console.error('Authentication error:', error);
+    console.error('Authentication flow error:', error);
     return {
       success: false,
       error: error instanceof Error ? error.message : 'Unknown authentication error'
@@ -99,87 +61,148 @@ export async function authenticateUser(): Promise<AuthResponse> {
 }
 
 /**
- * Alternative authentication flow when launchWebAuthFlow fails
- * Opens the auth page in a new tab and listens for a message from the auth page
+ * Set up a message listener for the authentication callback
  */
-async function alternativeAuthFlow(authUrl: string, state: string): Promise<AuthResponse> {
+function setupAuthListener(expectedState: string): Promise<AuthResponse> {
   return new Promise((resolve) => {
-    // Set up a message listener to receive the auth code
-    const messageListener = async (message: any) => {
-      // Only process messages from our auth server
-      if (message.source !== 'notisky-auth' || !message.code) {
-        return;
-      }
-      
-      console.log('Received auth message:', message);
-      
-      // Clean up the listener
-      browser.runtime.onMessage.removeListener(messageListener);
-      
-      try {
-        // Verify state
-        if (message.state !== state) {
-          throw new Error('State mismatch, possible CSRF attack');
+    // Store the resolver function so we can call it when auth completes
+    storeResolver(resolve);
+    
+    // Set up storage listener to handle auth completion
+    const storageListener = async (changes: any) => {
+      if (changes.auth_code && changes.auth_state) {
+        const code = changes.auth_code.newValue;
+        const state = changes.auth_state.newValue;
+        
+        // Verify state matches
+        if (state !== expectedState) {
+          console.error('State mismatch in auth flow');
+          resolve({
+            success: false,
+            error: 'Security verification failed (state mismatch)'
+          });
+          return;
         }
         
-        // Exchange the code for a token
-        const tokenResponse = await exchangeCodeForToken(message.code);
-        
-        resolve({
-          success: true,
-          token: tokenResponse.access_token
-        });
-      } catch (error) {
-        console.error('Error in alternative auth flow:', error);
-        resolve({
-          success: false,
-          error: error instanceof Error ? error.message : 'Error in alternative auth flow'
-        });
+        try {
+          // Get stored code verifier
+          const { auth_code_verifier } = await browser.storage.local.get('auth_code_verifier');
+          
+          // Exchange code for token
+          const tokenResponse = await exchangeCodeForToken(code, auth_code_verifier);
+          
+          // Clean up storage
+          await browser.storage.local.remove(['auth_code', 'auth_state', 'auth_code_verifier']);
+          
+          // Resolve with success
+          resolve({
+            success: true,
+            token: tokenResponse.access_token
+          });
+        } catch (error: any) {
+          console.error('Error exchanging code for token:', error);
+          resolve({
+            success: false,
+            error: error instanceof Error ? error.message : 'Token exchange failed'
+          });
+        }
       }
     };
     
-    // Register the message listener
-    browser.runtime.onMessage.addListener(messageListener);
+    // Listen for storage changes
+    browser.storage.onChanged.addListener(storageListener);
     
-    // Skip notification and just create a new tab with the auth URL
-    console.log('Opening auth URL in new tab:', authUrl);
-    
-    // Add the extension identifier to the URL to help the auth page detect the extension
-    const enhancedAuthUrl = new URL(authUrl);
-    enhancedAuthUrl.searchParams.append('client_mode', 'extension_tab');
-    
-    // Open the auth URL in a new tab
-    browser.tabs.create({ url: enhancedAuthUrl.toString() })
-      .catch(error => {
-        console.error('Error opening auth tab:', error);
-        resolve({
-          success: false,
-          error: 'Failed to open authentication tab'
-        });
-      });
-    
-    // Set a timeout to clean up if no response is received
+    // Set a timeout to clean up and reject after 5 minutes
     setTimeout(() => {
-      browser.runtime.onMessage.removeListener(messageListener);
+      browser.storage.onChanged.removeListener(storageListener);
       resolve({
         success: false,
         error: 'Authentication timed out. Please try again.'
       });
-    }, 120000); // 2 minute timeout
+    }, 300000); // 5 minute timeout
+  });
+}
+
+/**
+ * Store the resolver function in storage for later use by the callback page
+ */
+async function storeResolver(resolve: (value: AuthResponse) => void) {
+  // Store the resolver in a global variable that can be accessed by the content script
+  // @ts-ignore
+  window.notiskyAuthResolver = resolve;
+}
+
+/**
+ * Build the authorization URL for Bluesky OAuth
+ */
+function buildAuthUrl(state: string, codeChallenge: string): string {
+  const url = new URL(AUTH_CONFIG.authUrl);
+  
+  // Add required OAuth 2.0 parameters
+  url.searchParams.append('client_id', AUTH_CONFIG.clientId);
+  url.searchParams.append('redirect_uri', AUTH_CONFIG.redirectUrl);
+  url.searchParams.append('response_type', 'code');
+  url.searchParams.append('state', state);
+  url.searchParams.append('code_challenge', codeChallenge);
+  url.searchParams.append('code_challenge_method', 'S256');
+  
+  // Add Bluesky-specific scopes
+  url.searchParams.append('scope', 'com.atproto.feed:read com.atproto.feed:write com.atproto.notification:read');
+  
+  console.log('Built auth URL:', url.toString());
+  return url.toString();
+}
+
+/**
+ * Generate a cryptographically secure random string
+ */
+function generateRandomString(length: number): string {
+  const array = new Uint8Array(length);
+  crypto.getRandomValues(array);
+  return Array.from(array, byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * Generate PKCE code challenge from verifier
+ */
+async function generateCodeChallenge(verifier: string): Promise<string> {
+  // Convert verifier to Uint8Array
+  const encoder = new TextEncoder();
+  const data = encoder.encode(verifier);
+  
+  // Hash with SHA-256
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  
+  // Convert to base64url
+  return btoa(String.fromCharCode(...new Uint8Array(hash)))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
+
+/**
+ * Store authentication state in local storage
+ */
+async function storeAuthState(state: string, codeVerifier: string): Promise<void> {
+  await browser.storage.local.set({
+    auth_state_expected: state,
+    auth_code_verifier: codeVerifier,
+    auth_flow_started: Date.now()
   });
 }
 
 /**
  * Exchange the authorization code for an access token
  */
-async function exchangeCodeForToken(code: string): Promise<any> {
-  const response = await fetch('https://notisky.symm.app/api/token', {
+async function exchangeCodeForToken(code: string, codeVerifier: string): Promise<any> {
+  const response = await fetch(`${AUTH_CONFIG.serverBaseUrl}/api/token`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json'
     },
     body: JSON.stringify({
       code,
+      code_verifier: codeVerifier,
       redirect_uri: AUTH_CONFIG.redirectUrl,
       client_id: 'notisky-extension',
       grant_type: 'authorization_code'

@@ -177,10 +177,42 @@ export default defineBackground((context) => {
             console.error('Notisky: Error writing to storage', storageError);
           }
 
-          // Handle authentication response from external page
+          // Handle authentication success message from content script
+          if (message.action === 'authSuccess') {
+            console.log('Notisky: Received authentication success from content script');
+            
+            handleAuthSuccess(message.code, message.state)
+              .then(() => {
+                sendResponse({ success: true });
+              })
+              .catch(error => {
+                console.error('Notisky: Error handling auth success:', error);
+                sendResponse({ success: false, error: error.message });
+              });
+            
+            return true;
+          }
+          
+          // Handle authentication error message from content script
+          if (message.action === 'authError') {
+            console.error('Notisky: Authentication error from content script:', message.error);
+            sendResponse({ success: false });
+            return true;
+          }
+
+          // Legacy: Handle authentication response from external page
           if (message.source === 'notisky-auth' && message.code) {
             console.log('Notisky: Received authentication response from external page');
-            sendResponse({ success: true });
+            
+            handleAuthSuccess(message.code, message.state)
+              .then(() => {
+                sendResponse({ success: true });
+              })
+              .catch(error => {
+                console.error('Notisky: Error handling auth response:', error);
+                sendResponse({ success: false, error: error.message });
+              });
+            
             return true;
           }
 
@@ -1494,6 +1526,96 @@ export default defineBackground((context) => {
         success: false,
         error: error instanceof Error ? error.message : 'Unknown authentication error'
       };
+    }
+  }
+
+  /**
+   * Handle successful authentication from the content script or external page
+   */
+  async function handleAuthSuccess(code: string, state: string) {
+    try {
+      // Verify the expected state
+      const { auth_state_expected, auth_code_verifier } = await browser.storage.local.get([
+        'auth_state_expected',
+        'auth_code_verifier'
+      ]);
+      
+      if (state !== auth_state_expected) {
+        throw new Error('State mismatch in authentication flow');
+      }
+      
+      // Exchange the code for a token
+      const response = await fetch(`${AUTH_SERVER_URL}/api/token`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          code,
+          code_verifier: auth_code_verifier,
+          redirect_uri: `${AUTH_SERVER_URL}/auth/callback`,
+          client_id: 'notisky-extension',
+          grant_type: 'authorization_code'
+        })
+      });
+      
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || 'Failed to exchange code for token');
+      }
+      
+      const tokenData = await response.json();
+      
+      // Store the auth token
+      await storeAuthToken(tokenData.access_token);
+      
+      // Clean up the stored state data
+      await browser.storage.local.remove([
+        'auth_state_expected',
+        'auth_code_verifier',
+        'auth_flow_started'
+      ]);
+      
+      // Update user interface to show authenticated state
+      await updateUIForAuthenticatedState();
+      
+      return true;
+    } catch (error) {
+      console.error('Error in handleAuthSuccess:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Update the UI to reflect authenticated state
+   */
+  async function updateUIForAuthenticatedState() {
+    try {
+      // Update the extension icon
+      browser.action.setIcon({
+        path: {
+          16: '/icon/16-active.png',
+          48: '/icon/48-active.png',
+          128: '/icon/128-active.png'
+        }
+      });
+      
+      // Update the extension badge
+      browser.action.setBadgeText({ text: '' });
+      
+      // Set a storage flag to indicate authentication state
+      await browser.storage.local.set({ isAuthenticated: true });
+      
+      // Notify any open popup or options pages
+      browser.runtime.sendMessage({
+        action: 'authStateChanged',
+        isAuthenticated: true
+      }).catch(() => {
+        // Ignore errors if no listeners
+      });
+      
+    } catch (error) {
+      console.error('Error updating UI for authenticated state:', error);
     }
   }
 });

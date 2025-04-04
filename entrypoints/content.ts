@@ -978,5 +978,92 @@ export default defineContentScript({
     } else {
       console.log('Notisky: In build environment, skipping initialization');
     }
+
+    // Listen for messages from the background script
+    browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
+      console.log('Content script received message:', message);
+      
+      // Handle any specific message types here
+      if (message.action === 'checkPage') {
+        sendResponse({ success: true, url: window.location.href });
+      }
+      
+      return true;
+    });
+
+    // Check if we're on the auth callback page
+    const isAuthCallbackPage = window.location.href.includes('/auth/callback');
+
+    if (isAuthCallbackPage) {
+      console.log('Detected auth callback page, processing auth response');
+      processAuthCallback();
+    }
+
+    /**
+     * Process the authentication callback
+     */
+    function processAuthCallback() {
+      try {
+        // Parse URL parameters
+        const urlParams = new URLSearchParams(window.location.search);
+        const code = urlParams.get('code');
+        const state = urlParams.get('state');
+        const error = urlParams.get('error');
+        
+        if (error) {
+          console.error('Auth error received:', error);
+          // Send error to background script
+          browser.runtime.sendMessage({
+            action: 'authError',
+            error: error
+          });
+          return;
+        }
+        
+        if (!code || !state) {
+          console.error('Missing required parameters in auth callback');
+          return;
+        }
+        
+        console.log('Auth callback received code and state, sending to background');
+        
+        // Method 1: Send message to background script
+        browser.runtime.sendMessage({
+          action: 'authSuccess',
+          code: code,
+          state: state
+        });
+        
+        // Method 2: Store in local storage for the listener in auth.ts
+        browser.storage.local.set({
+          auth_code: code,
+          auth_state: state,
+          auth_timestamp: Date.now()
+        });
+        
+        // Show a success message
+        const statusElement = document.getElementById('status');
+        if (statusElement) {
+          statusElement.textContent = 'Authentication successful! You can close this tab.';
+          statusElement.className = 'success';
+        }
+        
+        // Auto-close the tab after a delay
+        setTimeout(() => {
+          try {
+            window.close();
+          } catch (e) {
+            console.log('Could not auto-close tab:', e);
+            // Update status message
+            if (statusElement) {
+              statusElement.textContent = 'Authentication complete! You can now close this tab manually.';
+            }
+          }
+        }, 3000);
+        
+      } catch (error) {
+        console.error('Error processing auth callback:', error);
+      }
+    }
   }
 });
