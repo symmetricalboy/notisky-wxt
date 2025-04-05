@@ -24,46 +24,65 @@ function processAuthData(code: string, state: string) {
       state
     };
     
-    // Send message to background script
+    // Try with both browser and chrome APIs to ensure compatibility
     if (typeof browser !== 'undefined' && browser.runtime && browser.runtime.sendMessage) {
-      console.log('Sending auth data to extension background script');
+      console.log('Sending auth data to extension background script via browser API');
       browser.runtime.sendMessage(messageData)
         .then(response => {
           console.log('Background script response:', response);
-          
-          // Notify the page that we successfully extracted the data
-          const event = new CustomEvent('notisky-auth-detected', {
-            detail: { success: true }
-          });
-          document.dispatchEvent(event);
-          
-          // Update UI elements if they exist
-          const statusElement = document.getElementById('auth-status');
-          if (statusElement) {
-            statusElement.textContent = 'Authentication data received by extension';
-            statusElement.className = 'success';
-          }
+          notifySuccess();
         })
         .catch(error => {
-          console.error('Error sending message to background script:', error);
-          
-          // Notify the page about the error
-          const event = new CustomEvent('notisky-auth-detected', {
-            detail: { success: false, error }
-          });
-          document.dispatchEvent(event);
+          console.error('Error sending message via browser API:', error);
+          // Fallback to chrome API
+          if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
+            sendViaChrome(messageData);
+          } else {
+            throw error;
+          }
         });
+    } else if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
+      sendViaChrome(messageData);
     } else {
-      console.error('Browser runtime API not available for sending messages');
-      throw new Error('Browser runtime API not available');
+      console.error('Neither browser nor chrome runtime API available for sending messages');
+      throw new Error('Extension messaging API not available');
     }
   } catch (error) {
     console.error('Error processing auth data:', error);
   }
 }
 
+function sendViaChrome(messageData) {
+  console.log('Sending auth data to extension background script via Chrome API');
+  chrome.runtime.sendMessage(messageData, response => {
+    console.log('Background script response (Chrome API):', response);
+    notifySuccess();
+  });
+}
+
+function notifySuccess() {
+  // Notify the page that we successfully extracted the data
+  const event = new CustomEvent('notisky-auth-detected', {
+    detail: { success: true }
+  });
+  document.dispatchEvent(event);
+  window.dispatchEvent(event);
+  
+  // Update UI elements if they exist
+  const statusElement = document.getElementById('detection-status');
+  if (statusElement) {
+    statusElement.textContent = 'Authentication data received by extension!';
+    statusElement.style.color = '#4caf50';
+  }
+  
+  const detectionComplete = document.getElementById('detection-complete');
+  if (detectionComplete) {
+    detectionComplete.style.display = 'block';
+  }
+}
+
 // Check 1: Listen for custom event
-document.addEventListener('notisky-auth-available', (event: any) => {
+window.addEventListener('notisky-auth-available', (event: any) => {
   console.log('Detected notisky-auth-available event');
   const detail = event.detail || {};
   
@@ -89,6 +108,17 @@ function checkDomForAuthData() {
     }
   }
   
+  // Check URL parameters directly
+  const urlParams = new URLSearchParams(window.location.search);
+  const code = urlParams.get('code');
+  const state = urlParams.get('state');
+  
+  if (code && state) {
+    console.log('Found auth data in URL parameters');
+    processAuthData(code, state);
+    return true;
+  }
+  
   return false;
 }
 
@@ -112,7 +142,9 @@ function isAuthSuccessPage() {
   try {
     // Check URL pattern if window.location is available
     if (typeof window !== 'undefined' && window.location && window.location.href) {
-      return window.location.href.includes('auth-success.html');
+      return window.location.href.includes('auth-success.html') || 
+             window.location.href.includes('auth/extension-callback') ||
+             window.location.href.includes('oauth=success');
     }
     
     // Fallback: check for specific element that should only be on our auth success page
@@ -124,7 +156,13 @@ function isAuthSuccessPage() {
   }
 }
 
-// Run checks when DOM is fully loaded
+// Run checks right away, don't wait for DOMContentLoaded
+console.log('Running initial auth check immediately');
+if (isAuthSuccessPage()) {
+  checkDomForAuthData() || checkLocalStorageForAuthData();
+}
+
+// Also run checks when DOM is fully loaded
 document.addEventListener('DOMContentLoaded', () => {
   console.log('DOM fully loaded, running auth data checks');
   
@@ -167,7 +205,7 @@ document.addEventListener('DOMContentLoaded', () => {
       clearInterval(checkInterval);
       
       // Update UI elements if they exist to show error
-      const statusElement = document.getElementById('auth-status');
+      const statusElement = document.getElementById('detection-status');
       if (statusElement) {
         statusElement.textContent = 'Could not find authentication data';
         statusElement.className = 'error';

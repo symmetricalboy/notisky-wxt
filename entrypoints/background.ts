@@ -80,11 +80,14 @@ export default defineBackground((context) => {
       
       // Handle OAuth callback from content scripts
       if (message.type === 'oauth_callback' && message.code && message.state) {
-        console.log('Received oauth_callback with code and state');
+        console.log('Received oauth_callback with code and state:', { 
+          code: message.code.substring(0, 5) + '...',
+          state: message.state.substring(0, 5) + '...'
+        });
         
         try {
           // Create a mock redirect URL to use with the existing handleAuthCallback function
-          const mockRedirectUrl = `notisky://auth?code=${message.code}&state=${message.state}`;
+          const mockRedirectUrl = `notisky://auth?code=${encodeURIComponent(message.code)}&state=${encodeURIComponent(message.state)}`;
           
           // Store the values we need for OAuth exchange first
           const storageData = await browser.storage.local.get([
@@ -114,8 +117,64 @@ export default defineBackground((context) => {
             });
           }
           
-          // Process the auth callback
-          await handleAuthCallback(mockRedirectUrl);
+          // Try to use the exchangeCodeForToken function directly since we have the code and state
+          console.log('Attempting direct token exchange');
+          try {
+            const tokenData = await exchangeCodeForToken(
+              message.code,
+              storageData.auth_client_id || 'https://notisky.symm.app/client-metadata.json',
+              storageData.auth_code_verifier || message.state,
+              storageData.auth_redirect_uri || 'https://notisky.symm.app/auth/extension-callback'
+            );
+            
+            if (tokenData.success && tokenData.did && tokenData.accessJwt && tokenData.refreshJwt && tokenData.handle) {
+              console.log('Direct token exchange successful for:', tokenData.handle);
+              
+              const newSession: StoredAccountSession = {
+                did: tokenData.did,
+                handle: tokenData.handle,
+                accessJwt: tokenData.accessJwt,
+                refreshJwt: tokenData.refreshJwt,
+              };
+              
+              await storeAccountSession(newSession);
+              console.log('Account session stored successfully for DID:', newSession.did);
+              
+              // Update cache after storing
+              cachedAccounts = await getAllAccountSessions();
+              
+              await initHeadlessClientForAccount(newSession.did);
+              
+              // Close the authentication tab if we can identify it
+              if (sender.tab && sender.tab.id) {
+                try {
+                  await browser.tabs.remove(sender.tab.id);
+                  console.log('Closed authentication tab');
+                } catch (e) {
+                  console.warn('Could not close authentication tab:', e);
+                }
+              }
+              
+              // Send success response
+              sendResponse({ success: true, message: 'Authentication processed successfully' });
+              
+              // Notify popup if it's open
+              try {
+                await browser.runtime.sendMessage({ action: 'accountAdded', account: newSession });
+                console.log('Sent accountAdded message to UI');
+              } catch (msgError) {
+                console.warn('Could not send accountAdded message, UI might not be open:', msgError);
+              }
+              
+              return true;
+            } else {
+              throw new Error(tokenData.error || 'Token exchange failed');
+            }
+          } catch (directExchangeError) {
+            console.warn('Direct token exchange failed, falling back to handleAuthCallback:', directExchangeError);
+            // Process the auth callback with the full handleAuthCallback function as fallback
+            await handleAuthCallback(mockRedirectUrl);
+          }
           
           // Close the authentication tab if we can identify it
           if (sender.tab && sender.tab.id) {

@@ -76,8 +76,24 @@ export default defineConfig({
       import: './entrypoints/content-auth-detector.ts',
       matches: [
         '*://notisky.symm.app/auth-success.html*',
+        '*://notisky.symm.app/?oauth=success*',
+        '*://notisky.symm.app/auth/extension-callback*',
         'http://localhost:3000/auth-success.html*',
-        'https://localhost:3000/auth-success.html*'
+        'http://localhost:3000/?oauth=success*',
+        'https://localhost:3000/auth-success.html*',
+        'https://localhost:3000/?oauth=success*'
+      ]
+    },
+    'auth-success-helper': {
+      import: './entrypoints/content-scripts/auth-success-helper.ts',
+      matches: [
+        '*://notisky.symm.app/auth-success.html*',
+        '*://notisky.symm.app/?oauth=success*',
+        '*://notisky.symm.app/auth/extension-callback*',
+        'http://localhost:3000/auth-success.html*',
+        'http://localhost:3000/?oauth=success*',
+        'https://localhost:3000/auth-success.html*',
+        'https://localhost:3000/?oauth=success*'
       ]
     },
     popup: './entrypoints/popup/index.html',
