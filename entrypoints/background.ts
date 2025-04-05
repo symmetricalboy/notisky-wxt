@@ -290,7 +290,51 @@ export default defineBackground((context) => {
             }
             return true;
             
-          // Handle badge clearing
+          // Handle get preferences request
+          case 'getPreferences':
+            console.log('Getting preferences for options panel');
+            try {
+              const prefs = await loadPreferences();
+              console.log('Returning preferences:', prefs);
+              sendResponse({ success: true, preferences: prefs });
+            } catch (error) {
+              console.error('Error getting preferences:', error);
+              sendResponse({ 
+                success: false, 
+                error: error instanceof Error ? error.message : 'Failed to retrieve preferences' 
+              });
+            }
+            return true;
+
+          // Handle save preferences request
+          case 'savePreferences':
+            console.log('Saving preferences from options panel:', message.preferences);
+            try {
+              if (!message.preferences) {
+                throw new Error('No preferences data provided');
+              }
+              
+              const success = await savePreferences(message.preferences);
+              if (success) {
+                // Update current preferences
+                currentPreferences = message.preferences;
+                // Apply changes immediately
+                await updatePollingIntervalsOnPreferenceChange();
+                console.log('Preferences saved and applied successfully');
+                sendResponse({ success: true });
+              } else {
+                throw new Error('Failed to save preferences');
+              }
+            } catch (error) {
+              console.error('Error saving preferences:', error);
+              sendResponse({ 
+                success: false, 
+                error: error instanceof Error ? error.message : 'Failed to save preferences' 
+              });
+            }
+            return true;
+
+          // Handle clear notification count
           case 'clearNewNotificationCount':
             console.log('Clearing notification badge count');
             try {

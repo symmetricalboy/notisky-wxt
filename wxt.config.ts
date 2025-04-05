@@ -70,7 +70,11 @@ export default defineConfig({
     content: './entrypoints/content.ts',
     'content-auth-callback': {
       import: './entrypoints/content-auth-callback.ts',
-      matches: ['*://notisky.symm.app/auth/extension-callback*', '*://notisky.symm.app/auth-ext.html*']
+      matches: [
+        '*://notisky.symm.app/auth/extension-callback*',
+        '*://notisky.symm.app/auth/callback*', 
+        '*://notisky.symm.app/auth-ext.html*'
+      ]
     },
     'content-auth-detector': {
       import: './entrypoints/content-auth-detector.ts',
@@ -78,6 +82,7 @@ export default defineConfig({
         '*://notisky.symm.app/auth-success.html*',
         '*://notisky.symm.app/?oauth=success*',
         '*://notisky.symm.app/auth/extension-callback*',
+        '*://notisky.symm.app/auth/callback*',
         'http://localhost:3000/auth-success.html*',
         'http://localhost:3000/?oauth=success*',
         'https://localhost:3000/auth-success.html*',
@@ -90,6 +95,7 @@ export default defineConfig({
         '*://notisky.symm.app/auth-success.html*',
         '*://notisky.symm.app/?oauth=success*',
         '*://notisky.symm.app/auth/extension-callback*',
+        '*://notisky.symm.app/auth/callback*',
         'http://localhost:3000/auth-success.html*',
         'http://localhost:3000/?oauth=success*',
         'https://localhost:3000/auth-success.html*',

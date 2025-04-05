@@ -5,7 +5,7 @@ export interface UserPreferences {
   pollingIntervalMinutes: number;
   showDesktopNotifications: boolean;
   showDetailedNotifications: boolean;
-  // Add other preferences here as needed
+  desktopNotificationsEnabled: boolean;
 }
 
 // Define default values for preferences
@@ -13,6 +13,7 @@ export const defaultPreferences: UserPreferences = {
   pollingIntervalMinutes: 1,
   showDesktopNotifications: true,
   showDetailedNotifications: true,
+  desktopNotificationsEnabled: true,
 };
 
 const PREFERENCES_STORAGE_KEY = 'notisky_preferences';
@@ -44,6 +45,9 @@ export async function savePreferences(prefs: UserPreferences): Promise<boolean> 
     if (prefs.pollingIntervalMinutes < 1) {
       prefs.pollingIntervalMinutes = 1; // Enforce minimum interval
     }
+    
+    // Ensure backward compatibility - map showDesktopNotifications to desktopNotificationsEnabled
+    prefs.desktopNotificationsEnabled = prefs.showDesktopNotifications;
     
     await browser.storage.sync.set({ [PREFERENCES_STORAGE_KEY]: prefs });
     console.log('Preferences saved:', prefs);

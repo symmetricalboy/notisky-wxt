@@ -7,13 +7,7 @@ import { defaultPreferences } from '../../utils/preferences'; // Correct path
 // import './App.css'; 
 import './style.css'; // Use existing style for now
 
-// TODO: Define preference interface and storage logic
-interface UserPreferences {
-  // Define preference fields here
-  pollingIntervalMinutes: number;
-  showDesktopNotifications: boolean;
-  showDetailedNotifications: boolean;
-}
+// No need to redefine UserPreferences interface - use the imported one
 
 const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'accounts' | 'preferences' | 'about'>('accounts');
@@ -241,7 +235,11 @@ const App: React.FC = () => {
                 <input
                   type="checkbox"
                   checked={preferences.showDesktopNotifications}
-                  onChange={(e) => handlePreferenceChange('showDesktopNotifications', e.target.checked)}
+                  onChange={(e) => {
+                    // Update both properties for compatibility
+                    handlePreferenceChange('showDesktopNotifications', e.target.checked);
+                    handlePreferenceChange('desktopNotificationsEnabled', e.target.checked);
+                  }}
                   disabled={savingPreferences}
                 />
                 Show Desktop Notifications
