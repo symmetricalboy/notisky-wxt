@@ -10,7 +10,7 @@ interface DPoPKeyPair {
 // Use the URL of the hosted metadata file as the client_id
 const METADATA_CLIENT_ID_URL = 'https://notisky.symm.app/client-metadata.json'; 
 // const BLUESKY_CLIENT_ID = 'YOUR_BLUESKY_CLIENT_ID_HERE'; // <-- REMOVE STATIC PLACEHOLDER
-const BLUESKY_AUTHORIZATION_ENDPOINT = 'https://bsky.app/oauth/authorize';
+const BLUESKY_AUTHORIZATION_ENDPOINT = 'https://notisky.vercel.app/api/auth/authorize'; // Updated to use our server
 const BLUESKY_TOKEN_ENDPOINT = 'https://bsky.app/xrpc/com.atproto.server.oauthGetAccessToken'; // Use correct XRPC endpoint
 const DPOP_KEY_STORAGE_KEY = 'notisky_dpop_keypair';
 const TOKEN_ENDPOINT_NONCE_KEY = 'notisky_token_endpoint_nonce';
