@@ -40,6 +40,14 @@ export default defineConfig({
     externally_connectable: {
       matches: ['*://notisky.symm.app/*']
     },
+    // Add external message listener to receive messages from auth server
+    background: {
+      service_worker: 'background.js'
+    },
+    content_security_policy: {
+      extension_pages: "script-src 'self'; object-src 'self'",
+      sandbox: "sandbox allow-scripts; script-src 'self' 'unsafe-eval'; object-src 'self'"
+    },
     // Add OAuth2 configuration for smoother identity flow
     oauth2: {
       client_id: 'notisky-extension',
@@ -58,6 +66,10 @@ export default defineConfig({
       import: './entrypoints/background.ts'
     },
     content: './entrypoints/content.ts',
+    'content-auth-callback': {
+      import: './entrypoints/content-auth-callback.ts',
+      matches: ['*://notisky.symm.app/auth/extension-callback*', '*://notisky.symm.app/auth-ext.html*']
+    },
     popup: './entrypoints/popup/index.html',
     options: './entrypoints/options/index.html'
   },

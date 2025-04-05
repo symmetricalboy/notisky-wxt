@@ -8,9 +8,9 @@ interface DPoPKeyPair {
 
 // Endpoints and Keys (Verify these)
 // Use the URL of the hosted metadata file as the client_id
-const METADATA_CLIENT_ID_URL = 'https://notisky.symm.app/.well-known/oauth-client-metadata.json'; 
+const METADATA_CLIENT_ID_URL = 'https://notisky.symm.app'; // Updated to use domain directly
 // const BLUESKY_CLIENT_ID = 'YOUR_BLUESKY_CLIENT_ID_HERE'; // <-- REMOVE STATIC PLACEHOLDER
-const BLUESKY_AUTHORIZATION_ENDPOINT = 'https://notisky.symm.app/api/auth/authorize'; // Using the custom domain
+const BLUESKY_AUTHORIZATION_ENDPOINT = 'https://notisky.symm.app/auth-ext.html'; // Updated to use auth-ext.html
 const BLUESKY_TOKEN_ENDPOINT = 'https://bsky.app/xrpc/com.atproto.server.oauthGetAccessToken'; // Use correct XRPC endpoint
 const DPOP_KEY_STORAGE_KEY = 'notisky_dpop_keypair';
 const TOKEN_ENDPOINT_NONCE_KEY = 'notisky_token_endpoint_nonce';
@@ -212,44 +212,37 @@ export async function initiateBlueskyAuth(): Promise<string> {
     const state = generateRandomString(32);
     const codeVerifier = generateRandomString(128);
     const codeChallenge = await generateCodeChallenge(codeVerifier);
-    const redirectUri = browser.identity.getRedirectURL(); 
-    const clientId = METADATA_CLIENT_ID_URL; // <-- USE THE METADATA URL
-
+    
+    // Store the extension ID, which will be used to communicate back to the extension
+    const extensionId = browser.runtime.id;
+    
     // Store necessary info for the token exchange step
     await browser.storage.local.set({
       auth_state_expected: state,
       auth_code_verifier: codeVerifier,
-      auth_client_id: clientId,      // Store actual clientId used (the URL)
-      auth_redirect_uri: redirectUri   // Store redirectUri for validation
+      auth_client_id: 'https://notisky.symm.app', // Use the domain directly as client_id
+      auth_redirect_uri: 'https://notisky.symm.app/auth/extension-callback' // Use server-side redirect
     });
 
-    const authUrl = new URL(BLUESKY_AUTHORIZATION_ENDPOINT);
-    authUrl.searchParams.append('response_type', 'code');
-    authUrl.searchParams.append('client_id', clientId); // <-- Use metadata URL
-    authUrl.searchParams.append('redirect_uri', redirectUri);
-    authUrl.searchParams.append('scope', 'com.atproto.repo.read com.atproto.repo.write com.atproto.notification.read'); // Example scopes, adjust as needed
-    authUrl.searchParams.append('state', state);
-    authUrl.searchParams.append('code_challenge', codeChallenge);
-    authUrl.searchParams.append('code_challenge_method', 'S256');
+    // Use the auth-ext.html page instead of launchWebAuthFlow
+    const authUrl = `https://notisky.symm.app/auth-ext.html?` + 
+      `extension_id=${encodeURIComponent(extensionId)}` + 
+      `&state=${encodeURIComponent(state)}` + 
+      `&code_challenge=${encodeURIComponent(codeChallenge)}` + 
+      `&code_verifier=${encodeURIComponent(codeVerifier)}`;
 
-    console.log('Initiating auth flow with URL:', authUrl.toString());
+    console.log('Opening auth page:', authUrl);
 
-    const resultUrl = await browser.identity.launchWebAuthFlow({
-      interactive: true,
-      url: authUrl.toString(),
-    });
-
-    if (!resultUrl) {
-        console.log('Auth flow cancelled by user or failed (no result URL).');
-        throw new Error('Authentication flow cancelled or failed.');
-    }
-
-    console.log('Auth flow window completed, returning result URL.');
-    return resultUrl;
+    // Open a new tab with the auth page
+    const tab = await browser.tabs.create({ url: authUrl });
+    
+    // Return a placeholder URL that will be used by the background script
+    // The actual code will come through the messaging system
+    return `notisky://auth?tab_id=${tab.id}&pending=true`;
 
   } catch (error: any) {
     console.error('Error during Bluesky authentication flow initiation:', error);
-    // Clean up stored values if initiation fails?
+    // Clean up stored values if initiation fails
     await browser.storage.local.remove(['auth_state_expected', 'auth_code_verifier', 'auth_client_id', 'auth_redirect_uri']);
     throw new Error(error.message || 'Error launching auth flow.');
   }
@@ -289,6 +282,9 @@ export async function exchangeCodeForToken(
 
   try {
     console.log(`Attempting token exchange via XRPC (Attempt ${retryAttempt + 1})`);
+    console.log('Using client ID:', clientId);
+    console.log('Using redirect URI:', redirectUri);
+    
     const response = await fetch(BLUESKY_TOKEN_ENDPOINT, {
       method: 'POST',
       headers: {
@@ -301,6 +297,7 @@ export async function exchangeCodeForToken(
         redirect_uri: redirectUri,
         client_id: clientId,
         code_verifier: codeVerifier,
+        scope: 'atproto transition:generic transition:chat.bsky' // Updated scope format
       }),
     });
 

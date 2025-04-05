@@ -97,6 +97,15 @@ export default defineBackground((context) => {
         return;
     }
 
+    // Check if this is our special URL format
+    if (redirectUrl.startsWith('notisky://auth?tab_id=')) {
+        console.log('This is a tab-based auth flow, waiting for message from auth server...');
+        // The actual code and token will come via message passing, so we don't need to do anything here
+        // The tab handling is done in the auth-ext.html page
+        return;
+    }
+
+    // For backward compatibility, we'll keep the original URL parsing logic
     // Define keys to retrieve from storage
     const storageKeys = ['auth_state_expected', 'auth_code_verifier', 'auth_client_id', 'auth_redirect_uri'];
 
@@ -291,6 +300,88 @@ export default defineBackground((context) => {
       browser.runtime.onMessage.addListener(async (message, sender, sendResponse) => {
         console.log('Notisky: Received message:', message, 'from:', sender.tab ? `tab ${sender.tab.id}` : "extension");
 
+        // Handle auth message from the content script or external source (auth server)
+        if (message.type === 'oauth_callback' || message.source === 'notisky-auth') {
+          console.log('Received auth callback message:', message);
+          // Extract the auth code and state
+          const code = message.code;
+          const state = message.state;
+          
+          if (code && state) {
+            console.log('Processing auth callback from auth server...');
+            
+            // Define keys to retrieve from storage
+            const storageKeys = ['auth_state_expected', 'auth_code_verifier', 'auth_client_id', 'auth_redirect_uri'];
+            
+            try {
+              // Retrieve stored values
+              const storedData = await browser.storage.local.get(storageKeys);
+              const expectedState = storedData.auth_state_expected;
+              const codeVerifier = storedData.auth_code_verifier;
+              const clientId = storedData.auth_client_id;
+              const storedRedirectUri = storedData.auth_redirect_uri;
+              
+              // Clean up stored values immediately
+              await browser.storage.local.remove(storageKeys);
+              
+              // Verify state
+              if (state !== expectedState) {
+                console.error('State mismatch:', { received: state, expected: expectedState });
+                sendResponse({ success: false, error: 'State mismatch' });
+                return;
+              }
+              
+              // Exchange code for token
+              console.log('Exchanging code for token...');
+              const tokenResult = await exchangeCodeForToken(
+                code,
+                clientId,
+                codeVerifier,
+                storedRedirectUri
+              );
+              
+              if (tokenResult.success && tokenResult.did && tokenResult.accessJwt && tokenResult.refreshJwt && tokenResult.handle) {
+                console.log('Token exchange successful:', tokenResult);
+                
+                const newSession: StoredAccountSession = {
+                  did: tokenResult.did,
+                  handle: tokenResult.handle,
+                  accessJwt: tokenResult.accessJwt,
+                  refreshJwt: tokenResult.refreshJwt,
+                };
+                
+                await storeAccountSession(newSession);
+                console.log('Account session stored successfully for DID:', newSession.did);
+                
+                // Update cache after storing
+                cachedAccounts = await getAllAccountSessions();
+                
+                await initHeadlessClientForAccount(newSession.did);
+                
+                // Notify any open UI
+                try {
+                  await browser.runtime.sendMessage({ action: 'accountAdded', account: newSession });
+                  console.log('Sent accountAdded message to UI');
+                } catch (msgError) {
+                  console.warn('Could not send accountAdded message, UI might not be open:', msgError);
+                }
+                
+                sendResponse({ success: true });
+              } else {
+                console.error('Token exchange failed:', tokenResult.error || 'Unknown error');
+                sendResponse({ success: false, error: tokenResult.error || 'Token exchange failed' });
+              }
+            } catch (error) {
+              console.error('Error processing auth callback:', error);
+              sendResponse({ success: false, error: error.message || 'Error processing auth callback' });
+            }
+            
+            // Indicates we'll send a response asynchronously
+            return true;
+          }
+        }
+
+        // Regular message handling...
         switch (message.action) {
           case 'authenticate':
             console.log('Initiating authentication flow...');
