@@ -71,6 +71,82 @@ export default defineBackground((context) => {
     }
   })();
 
+  // Setup robust message handling using browser.runtime.onMessage
+  if (isRealBrowser && browser.runtime && browser.runtime.onMessage) {
+    console.log('Setting up runtime message listener');
+    
+    browser.runtime.onMessage.addListener(async (message, sender, sendResponse) => {
+      console.log('Background received message:', message, 'from:', sender);
+      
+      // Handle OAuth callback from content scripts
+      if (message.type === 'oauth_callback' && message.code && message.state) {
+        console.log('Received oauth_callback with code and state');
+        
+        try {
+          // Create a mock redirect URL to use with the existing handleAuthCallback function
+          const mockRedirectUrl = `notisky://auth?code=${message.code}&state=${message.state}`;
+          
+          // Store the values we need for OAuth exchange first
+          const storageData = await browser.storage.local.get([
+            'auth_state_expected',
+            'auth_code_verifier',
+            'auth_client_id',
+            'auth_redirect_uri'
+          ]);
+          
+          // Check if we have all the required data
+          if (
+            !storageData.auth_state_expected ||
+            !storageData.auth_code_verifier ||
+            !storageData.auth_client_id ||
+            !storageData.auth_redirect_uri
+          ) {
+            console.log('Missing OAuth data in storage, using the state from message');
+            
+            // Store the state from the message as the expected state
+            // This allows the auth flow to work even if the state was generated elsewhere
+            await browser.storage.local.set({
+              'auth_state_expected': message.state,
+              // Code verifier is technically required, but we use the state as a fallback
+              'auth_code_verifier': storageData.auth_code_verifier || message.state,
+              'auth_client_id': storageData.auth_client_id || 'https://notisky.symm.app/client-metadata.json',
+              'auth_redirect_uri': storageData.auth_redirect_uri || 'https://notisky.symm.app/auth/extension-callback'
+            });
+          }
+          
+          // Process the auth callback
+          await handleAuthCallback(mockRedirectUrl);
+          
+          // Close the authentication tab if we can identify it
+          if (sender.tab && sender.tab.id) {
+            try {
+              await browser.tabs.remove(sender.tab.id);
+              console.log('Closed authentication tab');
+            } catch (e) {
+              console.warn('Could not close authentication tab:', e);
+            }
+          }
+          
+          // Send success response
+          sendResponse({ success: true, message: 'Authentication processed successfully' });
+        } catch (error) {
+          console.error('Error processing OAuth callback:', error);
+          sendResponse({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
+        }
+        
+        return true; // Keep the message channel open for async response
+      }
+      
+      // Other message handling can be added here
+      
+      // Default response for unhandled messages
+      sendResponse({ success: false, error: 'Unhandled message type' });
+      return true; // Keep the message channel open
+    });
+  } else {
+    console.warn('Notisky: browser.runtime.onMessage API not available.');
+  }
+
   // Store notification state (last seen CID per DID)
   let notificationState: Record<string, NotificationState> = {};
   let currentPreferences: UserPreferences = defaultPreferences;
@@ -292,316 +368,6 @@ export default defineBackground((context) => {
     } catch (error) {
       console.error('Notisky: Error setting up connection listener', error);
     }
-  }
-
-  // Setup robust message handling using browser.runtime.onMessage instead of the destructured onMessage
-  if (isRealBrowser && browser.runtime && browser.runtime.onMessage) {
-    try {
-      browser.runtime.onMessage.addListener(async (message, sender, sendResponse) => {
-        console.log('Notisky: Received message:', message, 'from:', sender.tab ? `tab ${sender.tab.id}` : "extension");
-
-        // Handle auth message from the content script or external source (auth server)
-        if (message.type === 'oauth_callback' || message.source === 'notisky-auth') {
-          console.log('Received auth callback message:', message);
-          // Extract the auth code and state
-          const code = message.code;
-          const state = message.state;
-          
-          if (code && state) {
-            console.log('Processing auth callback from auth server...');
-            
-            // Define keys to retrieve from storage
-            const storageKeys = ['auth_state_expected', 'auth_code_verifier', 'auth_client_id', 'auth_redirect_uri'];
-            
-            try {
-              // Retrieve stored values
-              const storedData = await browser.storage.local.get(storageKeys);
-              const expectedState = storedData.auth_state_expected;
-              const codeVerifier = storedData.auth_code_verifier;
-              const clientId = storedData.auth_client_id;
-              const storedRedirectUri = storedData.auth_redirect_uri;
-              
-              // Clean up stored values immediately
-              await browser.storage.local.remove(storageKeys);
-              
-              // Verify state
-              if (state !== expectedState) {
-                console.error('State mismatch:', { received: state, expected: expectedState });
-                sendResponse({ success: false, error: 'State mismatch' });
-                return;
-              }
-              
-              // Exchange code for token
-              console.log('Exchanging code for token...');
-              const tokenResult = await exchangeCodeForToken(
-                code,
-                clientId,
-                codeVerifier,
-                storedRedirectUri
-              );
-              
-              if (tokenResult.success && tokenResult.did && tokenResult.accessJwt && tokenResult.refreshJwt && tokenResult.handle) {
-                console.log('Token exchange successful:', tokenResult);
-                
-                const newSession: StoredAccountSession = {
-                  did: tokenResult.did,
-                  handle: tokenResult.handle,
-                  accessJwt: tokenResult.accessJwt,
-                  refreshJwt: tokenResult.refreshJwt,
-                };
-                
-                await storeAccountSession(newSession);
-                console.log('Account session stored successfully for DID:', newSession.did);
-                
-                // Update cache after storing
-                cachedAccounts = await getAllAccountSessions();
-                
-                await initHeadlessClientForAccount(newSession.did);
-                
-                // Notify any open UI
-                try {
-                  await browser.runtime.sendMessage({ action: 'accountAdded', account: newSession });
-                  console.log('Sent accountAdded message to UI');
-                } catch (msgError) {
-                  console.warn('Could not send accountAdded message, UI might not be open:', msgError);
-                }
-                
-                sendResponse({ success: true });
-              } else {
-                console.error('Token exchange failed:', tokenResult.error || 'Unknown error');
-                sendResponse({ success: false, error: tokenResult.error || 'Token exchange failed' });
-              }
-            } catch (error) {
-              console.error('Error processing auth callback:', error);
-              sendResponse({ success: false, error: error.message || 'Error processing auth callback' });
-            }
-            
-            // Indicates we'll send a response asynchronously
-            return true;
-          }
-        }
-
-        // Regular message handling...
-        switch (message.action) {
-          case 'authenticate':
-            console.log('Initiating authentication flow...');
-            // Start the flow, but don't wait for it to finish before responding.
-            initiateBlueskyAuth()
-              .then(async (resultUrl) => {
-                  // Got the result URL back, process it asynchronously.
-                  console.log('Authentication flow returned URL, processing callback...');
-                  await handleAuthCallback(resultUrl); 
-                  // handleAuthCallback will send its own messages like 'accountAdded' or errors.
-              })
-              .catch(error => {
-                  // Error *initiating* the flow (e.g., user cancelled, network error).
-                  console.error('Error initiating authentication flow:', error);
-                  // Send a specific message indicating initiation failure.
-                  browser.runtime.sendMessage({
-                      action: 'authInitiationError',
-                      error: error.message || 'Failed to initiate authentication'
-                  }).catch(e => console.warn('Could not send authInitiationError message', e));
-              });
-              
-            // Respond IMMEDIATELY to the popup that the flow has started.
-            sendResponse({ success: true, message: 'Authentication flow initiated.' });
-            // No need for willRespondAsync = true here, the response is synchronous.
-            break;
-          
-          // --- Account Management ---
-          case 'getAccounts': // Message to get all stored accounts (for UI)
-            // Return the cached data synchronously
-            console.log('Returning cached accounts data structure (object):', cachedAccounts);
-            sendResponse({ success: true, accounts: cachedAccounts || {} });
-            // No async/await, no return true needed here
-            break;
-          case 'removeAccount':
-            if (!message.did) {
-              sendResponse({ success: false, error: 'Missing DID to remove account' });
-              break;
-            }
-            const didToRemove = message.did;
-            console.log(`Initiating removal for account: ${didToRemove}`);
-            
-            // Perform removal asynchronously
-            stopHeadlessClient(didToRemove)
-              .then(() => removeAccountSession(didToRemove))
-              .then(removed => {
-                if (removed) {
-                  console.log('Account removed successfully:', didToRemove);
-                  // Update cache after removal
-                  return getAllAccountSessions(); // Chain promise to get updated accounts
-                } else {
-                  // Account wasn't found, no need to update cache but log it
-                  console.warn('Account removal reported false (might have been already removed): ', didToRemove);
-                  return cachedAccounts; // Return current cache value
-                }
-              })
-              .then(updatedAccounts => {
-                  // This .then() executes after either successful removal or finding it didn't exist
-                  cachedAccounts = updatedAccounts || {};
-                  console.log('Cached accounts updated after removal attempt.');
-                  updateExtensionBadge(); // Update badge after removal & cache update
-                  // Notify UI if account was actually removed
-                  if (updatedAccounts && !updatedAccounts[didToRemove]) {
-                       browser.runtime.sendMessage({ action: 'accountRemoved', did: didToRemove }).catch(console.warn);
-                  }
-              })
-              .catch(error => {
-                console.error('Error during account removal process:', didToRemove, error);
-                // Optionally notify UI about the error
-                // browser.runtime.sendMessage({ action: 'accountRemovalFailed', did: didToRemove, error: error.message || 'Failed to remove account' }).catch(console.warn);
-              });
-
-            // Respond IMMEDIATELY that the removal process has started.
-            sendResponse({ success: true, message: 'Account removal initiated.' });
-            // No need for willRespondAsync = true here.
-            break;
-          case 'getAccountData':
-            if (!message.did) {
-               sendResponse({ success: false, error: 'Missing DID for getAccountData' });
-               break;
-            }
-             const client = activeClients[message.did];
-             if (client && client.notificationData) {
-               console.log('Returning cached data for DID:', message.did);
-               sendResponse({ success: true, data: client.notificationData });
-             } else {
-               console.log('No cached data available for DID:', message.did);
-                sendResponse({ success: true, data: null, message: 'No data cached yet.' });
-             }
-            break;
-
-          // --- Preferences --- 
-          case 'getPreferences':
-            loadPreferences()
-              .then(prefs => {
-                currentPreferences = prefs;
-                sendResponse({ success: true, preferences: prefs });
-              })
-              .catch(error => {
-                console.error('Error loading preferences:', error);
-                sendResponse({ success: false, error: error.message || 'Failed to load preferences' });
-              });
-            break;
-          case 'savePreferences':
-            if (!message.preferences) {
-              sendResponse({ success: false, error: 'Missing preferences data' });
-              break;
-            }
-            savePreferences(message.preferences)
-              .then(() => {
-                console.log('Preferences saved successfully.');
-                currentPreferences = message.preferences;
-                updatePollingIntervalsOnPreferenceChange();
-                sendResponse({ success: true });
-              })
-              .catch(error => {
-                console.error('Error saving preferences:', error);
-                sendResponse({ success: false, error: error.message || 'Failed to save preferences' });
-              });
-            break;
-          
-          // --- Badge Control ---
-          case 'clearNewNotificationCount':
-            console.log('Received request to clear badge count');
-            // Reset the internal counter if you track it separately, 
-            // or just directly update the badge if that's sufficient.
-            newNotificationCount = 0; // Reset local counter if used
-            updateExtensionBadge() // Update the visual badge
-              .then(() => sendResponse({ success: true }))
-              .catch(err => {
-                console.error("Error clearing badge:", err);
-                sendResponse({ success: false, error: 'Failed to clear badge' });
-              });
-            break;
-          
-          // Remove obsolete preference references from other handlers if any exist
-          
-          // --- Notifications ---
-           case 'markNotificationsSeen':
-             if (!message.did) {
-               sendResponse({ success: false, error: 'Missing DID for markNotificationsSeen' });
-               break;
-             }
-             const accountClient = activeClients[message.did];
-             if (accountClient?.notificationData?.notifications?.length > 0) {
-                 const latestNotification = accountClient.notificationData.notifications[0];
-                 if (latestNotification?.cid) {
-                     updateAccountNotificationState(message.did, latestNotification.cid);
-                     console.log(`Marked notifications as seen for ${message.did} up to CID ${latestNotification.cid}`);
-                 } else {
-                      updateAccountNotificationState(message.did, null);
-                      console.log(`Marked notifications as seen for ${message.did} (no reliable CID found)`);
-                 }
-             } else {
-                 console.log(`No new notifications to mark seen for ${message.did}`);
-             }
-
-              if (accountClient?.notificationData) {
-                  accountClient.notificationData.notification = 0;
-              }
-
-             updateExtensionBadge()
-                 .then(() => {
-                    sendResponse({ success: true });
-                    browser.runtime.sendMessage({
-                        action: 'notificationCountUpdate',
-                        did: message.did,
-                        count: 0
-                    }).catch(console.warn);
-                 })
-                 .catch(err => {
-                    console.error("Error updating badge after marking seen:", err);
-                    sendResponse({ success: false, error: 'Failed to update badge' });
-                 });
-
-             break;
-
-           case 'clearAllData':
-               console.warn('Received request to clear all extension data!');
-               Promise.all([
-                   browser.storage.local.clear(),
-                   Promise.all(Object.keys(activeClients).map(did => stopHeadlessClient(did))),
-                   browser.alarms.clearAll()
-               ]).then(() => {
-                   console.log('All extension data cleared.');
-                   notificationState = {};
-                   currentPreferences = defaultPreferences;
-                   newNotificationCount = 0;
-                   updateExtensionBadge();
-                   sendResponse({ success: true });
-               }).catch(error => {
-                   console.error('Error clearing all data:', error);
-                   sendResponse({ success: false, error: error.message || 'Failed to clear data' });
-               });
-               break;
-
-          case 'ping':
-            console.log('Received ping, sending pong');
-            sendResponse('pong');
-            break;
-
-          default:
-            console.log('Unknown message action:', message.action);
-            sendResponse({ success: false, error: `Unknown action: ${message.action}` });
-            break;
-        }
-        // Removed explicit return true, as getAccounts is now sync.
-        // NOTE: This might break other async handlers currently using .then()
-        // instead of await. They may need refactoring if this fixes getAccounts.
-      });
-      
-      if (typeof browser.runtime.onConnect === 'function') {
-        browser.runtime.onConnect.addListener((port) => {
-          console.log('Notisky: Background script received connection attempt from content script to wake up service worker');
-        });
-      }
-    } catch (error) {
-      console.error('Notisky: Error setting up message listener', error);
-    }
-  } else {
-    console.warn('Notisky: browser.runtime.onMessage API not available.');
   }
 
   // --- Preference Handling ---

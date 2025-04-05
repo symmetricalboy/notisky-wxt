@@ -1,0 +1,83 @@
+{
+  "manifest_version": 3,
+  "name": "Notisky Notifications",
+  "description": "A Web Extension that enhances Bluesky with notification features",
+  "version": "1.0.0",
+  "icons": {
+    "16": "icon/16.png",
+    "32": "icon/32.png",
+    "48": "icon/48.png",
+    "96": "icon/96.png",
+    "128": "icon/128.png"
+  },
+  "permissions": [
+    "notifications",
+    "alarms",
+    "tabs",
+    "storage",
+    "identity",
+    "scripting"
+  ],
+  "host_permissions": [
+    "*://bsky.app/*",
+    "*://*.bsky.social/*",
+    "*://notisky.symm.app/*",
+    "*://*.bsky.social/xrpc/*",
+    "*://localhost:3000/*",
+    "http://localhost/*"
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "assets/*",
+        "icon/*"
+      ],
+      "matches": [
+        "*://bsky.app/*",
+        "*://*.bsky.social/*",
+        "*://notisky.symm.app/*",
+        "*://localhost:3000/*"
+      ]
+    }
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "notisky@extension.app"
+    }
+  },
+  "externally_connectable": {
+    "matches": [
+      "*://notisky.symm.app/*",
+      "*://localhost:3000/*"
+    ]
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' http://localhost:3000; object-src 'self';",
+    "sandbox": "script-src 'self' 'unsafe-eval' http://localhost:3000; sandbox allow-scripts; object-src 'self';"
+  },
+  "oauth2": {
+    "client_id": "notisky-extension",
+    "scopes": [
+      "read",
+      "write"
+    ]
+  },
+  "commands": {
+    "wxt:reload-extension": {
+      "description": "Reload the extension during development",
+      "suggested_key": {
+        "default": "Alt+R"
+      }
+    }
+  },
+  "action": {
+    "default_title": "Default Popup Title",
+    "default_popup": "popup.html"
+  },
+  "options_ui": {
+    "page": "options.html"
+  }
+}
