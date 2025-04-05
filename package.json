@@ -11,6 +11,7 @@
     "build": "wxt build",
     "build:firefox": "wxt build -b firefox",
     "build:safari": "wxt build -b safari",
+    "build:all": "npm run build && npm run build:firefox && npm run build:safari",
     "zip": "wxt zip",
     "zip:firefox": "wxt zip -b firefox",
     "zip:safari": "wxt zip -b safari",

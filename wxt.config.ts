@@ -87,7 +87,8 @@ export default defineConfig({
   outDir: 'dist',
   srcDir: '.',
   publicDir: 'public',
-  browsers: ['chrome', 'firefox', 'safari'],
+  browser: 'chrome,firefox,safari',
+  manifestVersion: 3,
   vite: (env) => ({
     optimizeDeps: {
       include: [

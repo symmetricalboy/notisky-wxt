@@ -137,9 +137,120 @@ export default defineBackground((context) => {
         return true; // Keep the message channel open for async response
       }
       
-      // Other message handling can be added here
+      // Handle standard popup actions
+      if (message.action) {
+        console.log('Processing action:', message.action);
+        
+        switch (message.action) {
+          // Handle getAccounts action from popup
+          case 'getAccounts':
+            try {
+              // Use cached accounts or fetch them
+              if (!cachedAccounts) {
+                cachedAccounts = await getAllAccountSessions();
+              }
+              console.log('Returning accounts:', cachedAccounts);
+              sendResponse({ success: true, accounts: cachedAccounts });
+            } catch (error) {
+              console.error('Error getting accounts:', error);
+              sendResponse({ 
+                success: false, 
+                error: error instanceof Error ? error.message : 'Failed to retrieve accounts' 
+              });
+            }
+            return true;
+            
+          // Handle ping/pong for testing connection
+          case 'ping':
+            console.log('Received ping, sending pong');
+            sendResponse('pong');
+            return true;
+            
+          // Handle authentication request
+          case 'authenticate':
+            console.log('Initiating authentication flow...');
+            // Start the flow without waiting for it to finish
+            initiateBlueskyAuth()
+              .then(async (resultUrl) => {
+                console.log('Authentication flow returned URL, processing callback...');
+                await handleAuthCallback(resultUrl);
+              })
+              .catch(error => {
+                console.error('Error initiating authentication flow:', error);
+                browser.runtime.sendMessage({
+                  action: 'authInitiationError',
+                  error: error instanceof Error ? error.message : 'Failed to initiate authentication'
+                }).catch(e => console.warn('Could not send authInitiationError message', e));
+              });
+            
+            // Respond immediately that the flow has started
+            sendResponse({ success: true, message: 'Authentication flow initiated.' });
+            return true;
+            
+          // Handle account removal
+          case 'removeAccount':
+            if (!message.did) {
+              sendResponse({ success: false, error: 'Missing DID to remove account' });
+              return true;
+            }
+            
+            const didToRemove = message.did;
+            console.log(`Initiating removal for account: ${didToRemove}`);
+            
+            try {
+              // Stop the headless client if it exists
+              await stopHeadlessClient(didToRemove);
+              
+              // Remove the account session
+              const removed = await removeAccountSession(didToRemove);
+              
+              if (removed) {
+                console.log('Account removed successfully:', didToRemove);
+                // Update cached accounts
+                cachedAccounts = await getAllAccountSessions();
+                
+                // Update the badge
+                updateExtensionBadge();
+                
+                // Notify UI about the removal
+                browser.runtime.sendMessage({ 
+                  action: 'accountRemoved', 
+                  did: didToRemove 
+                }).catch(console.warn);
+              } else {
+                console.warn('Account not found or already removed:', didToRemove);
+              }
+              
+              sendResponse({ success: true, message: 'Account removal completed' });
+            } catch (error) {
+              console.error('Error removing account:', error);
+              sendResponse({ 
+                success: false, 
+                error: error instanceof Error ? error.message : 'Failed to remove account' 
+              });
+            }
+            return true;
+            
+          // Handle badge clearing
+          case 'clearNewNotificationCount':
+            console.log('Clearing notification badge count');
+            try {
+              newNotificationCount = 0;
+              await updateExtensionBadge();
+              sendResponse({ success: true });
+            } catch (error) {
+              console.error('Error clearing badge:', error);
+              sendResponse({ 
+                success: false, 
+                error: error instanceof Error ? error.message : 'Failed to clear badge' 
+              });
+            }
+            return true;
+        }
+      }
       
       // Default response for unhandled messages
+      console.warn('Unhandled message type:', message);
       sendResponse({ success: false, error: 'Unhandled message type' });
       return true; // Keep the message channel open
     });
