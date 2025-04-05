@@ -8,7 +8,7 @@ interface DPoPKeyPair {
 
 // Endpoints and Keys (Verify these)
 // Use the URL of the hosted metadata file as the client_id
-const METADATA_CLIENT_ID_URL = 'did:web:notisky.symm.app'; 
+const METADATA_CLIENT_ID_URL = 'https://notisky.symm.app/.well-known/oauth-client-metadata.json'; 
 // const BLUESKY_CLIENT_ID = 'YOUR_BLUESKY_CLIENT_ID_HERE'; // <-- REMOVE STATIC PLACEHOLDER
 const BLUESKY_AUTHORIZATION_ENDPOINT = 'https://notisky.symm.app/api/auth/authorize'; // Using the custom domain
 const BLUESKY_TOKEN_ENDPOINT = 'https://bsky.app/xrpc/com.atproto.server.oauthGetAccessToken'; // Use correct XRPC endpoint
