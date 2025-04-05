@@ -23,12 +23,13 @@ export default defineConfig({
       '*://*.bsky.social/*',
       '*://notisky.symm.app/*',
       '*://*.bsky.social/xrpc/*',
-      '*://localhost:3000/*'
+      'http://localhost:3000/*',
+      'https://localhost:3000/*'
     ],
     web_accessible_resources: [
       {
         resources: ['assets/*', 'icon/*'],
-        matches: ['*://bsky.app/*', '*://*.bsky.social/*', '*://notisky.symm.app/*', '*://localhost:3000/*']
+        matches: ['*://bsky.app/*', '*://*.bsky.social/*', '*://notisky.symm.app/*', 'http://localhost:3000/*', 'https://localhost:3000/*']
       }
     ],
     // Include Firefox specific settings
@@ -39,7 +40,7 @@ export default defineConfig({
     },
     // Allow the GitHub Pages site to communicate with the extension
     externally_connectable: {
-      matches: ['*://notisky.symm.app/*', '*://localhost:3000/*']
+      matches: ['*://notisky.symm.app/*', 'http://localhost:3000/*', 'https://localhost:3000/*']
     },
     // Add external message listener to receive messages from auth server
     background: {
@@ -75,7 +76,8 @@ export default defineConfig({
       import: './entrypoints/content-auth-detector.ts',
       matches: [
         '*://notisky.symm.app/auth-success.html*',
-        '*://localhost:3000/auth-success.html*'
+        'http://localhost:3000/auth-success.html*',
+        'https://localhost:3000/auth-success.html*'
       ]
     },
     popup: './entrypoints/popup/index.html',
@@ -85,7 +87,7 @@ export default defineConfig({
   outDir: 'dist',
   srcDir: '.',
   publicDir: 'public',
-  browser: ['chrome', 'firefox', 'safari'],
+  browsers: ['chrome', 'firefox', 'safari'],
   vite: (env) => ({
     optimizeDeps: {
       include: [
