@@ -452,7 +452,7 @@ export default defineBackground((context) => {
       
       // Create a persistent alarm to keep the service worker alive in MV3
       browser.alarms.create('notiskyKeepAlive', {
-        periodInMinutes: 0.5 // Check every 30 seconds seems safer for MV3 keep-alive
+        periodInMinutes: 0.25 // Check every 15 seconds for MV3 keep-alive
       });
     } catch (error) {
       console.error('Notisky: Error creating core alarms', error);
@@ -516,7 +516,26 @@ export default defineBackground((context) => {
           console.warn('Notisky: Critical error in service worker keep-alive interval', error);
         }
       }
-    }, 4 * 60 * 1000);
+
+      // Try to create offscreen document (Chrome 116+) for better persistence
+      if (typeof browser.offscreen !== 'undefined' && typeof browser.offscreen.createDocument === 'function') {
+        try {
+          browser.offscreen.createDocument({
+            url: 'offscreen.html',
+            reasons: ['KEEP_ALIVE'],
+            justification: 'Keep notification service active'
+          }).catch(e => {
+            // Ignore error if document already exists
+            if (!e.message?.includes('already exists')) {
+              console.warn('Failed to create offscreen document:', e);
+            }
+          });
+        } catch (offscreenError) {
+          // Ignore API not available
+          if (Math.random() < 0.01) console.debug('Offscreen API not fully available:', offscreenError);
+        }
+      }
+    }, 60 * 1000); // Run every minute
     
     // Register a persistent connection listener
     try {
